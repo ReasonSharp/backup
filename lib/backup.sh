@@ -325,12 +325,12 @@ perform-restore() { # TODO: if isPITR=1, find the full backup that precedes targ
  local isPITR="${1}"
  local targetDatetimeStr="${2}"
  local ts="${3}"
- local restoreDbDir="${RestoreDir}/mariadb"
- cd "${restoreDbDir}" || { log-line err "cannot cd to ${restoreDbDir}"; return 1; }
+ local restoreDBDir="${RestoreDir}/mariadb"
+ cd "${restoreDBDir}" || { log-line err "cannot cd to ${restoreDBDir}"; return 1; }
  local baseDir="./base"
  local incDirs=($(ls -d ./_inc_* 2>/dev/null | sort))
  log-line msg "preparing backup chain (base = ${baseDir}, incrementals: ${#incDirs[@]}) ..."
- docker run --rm -v "$(pwd)/${baseDir}":/backup:rw \
+ docker run --rm -v "${restoreDBDir}/${baseDir}":/backup:rw \
   "${DBBackupImage}" bash -c 'mariadb-backup --prepare --target-dir=/backup
                         chown -R "'"$(id -u)":"$(id -g)"'" /backup' 2> /dev/null
  local inc
@@ -338,7 +338,7 @@ perform-restore() { # TODO: if isPITR=1, find the full backup that precedes targ
   local incName
   incName=$(basename "${inc}")
   log-line msg "-> applying incremental ${incName}"
-  docker run --rm -v "$(pwd)/${baseDir}":/base:rw -v "$(pwd)/${inc}":/inc:rw \
+  docker run --rm -v "${restoreDBDir}/${baseDir}":/base:rw -v "${restoreDBDir}/${inc}":/inc:rw \
    "${DBBackupImage}" bash -c 'mariadb-backup --prepare --target-dir=/base --incremental-dir=/inc
                          chown -R "'"$(id -u)":"$(id -g)"'" /base' 2> /dev/null
  done
@@ -351,11 +351,11 @@ perform-restore() { # TODO: if isPITR=1, find the full backup that precedes targ
  mv "${DBDataDir}" "${DBDataDir}-corrupted-$(date -u +"%Y%m%d%H%M%S")"
  mkdir -p "${DBDataDir}"
  log-line msg "copying back data from backup..."
- docker run --rm -v "${DBDataDir}":/var/lib/mysql:rw -v "$(pwd)/${baseDir}":/backup:ro \
+ docker run --rm -v "${DBDataDir}":/var/lib/mysql:rw -v "${restoreDBDir}/${baseDir}":/backup:ro \
   "${DBBackupImage}" mariadb-backup --copy-back --target-dir=/backup --datadir=/var/lib/mysql 2> /dev/null
  log-line msg "starting MariaDB container..."
  docker start "${DBContainerName}"
- wait-for-db "${DBContainerName}" root "${DBPassword}"
+ wait-for-db "${DBContainerName}" "${DBUser}" "${DBPassword}"
  if [ "${isPITR}" = "1" ] && [[ "${backupEndDatetime}" < "${targetDatetimeStr}" ]]; then
   log-line msg "applying binary logs from ${backupEndDatetime} -> ${targetDatetimeStr}..."
   local pitrDir
@@ -367,7 +367,7 @@ perform-restore() { # TODO: if isPITR=1, find the full backup that precedes targ
   else
    local binlogFiles=($(ls "${pitrDir}"/"${DBBinlogBasename}".* 2>/dev/null | grep -v ".idx" | grep -v ".index" | sort))
    if [ ${#binlogFiles[@]} -gt 0 ]; then
-    local binlogPosFile="${restoreDbDir}/base/mariadb_backup_binlog_info"
+    local binlogPosFile="${restoreDBDir}/base/mariadb_backup_binlog_info"
     local startFile
     startFile=$(awk '{print $1}' "${binlogPosFile}")
     local startPos
@@ -388,7 +388,7 @@ perform-restore() { # TODO: if isPITR=1, find the full backup that precedes targ
     binlogCmd="${binlogCmd} --stop-datetime=\"${targetDatetimeStr}\""
     log-line msg "executing: ${binlogCmd} | mariadb"
     echo '#!/bin/bash' > ./import-script.sh
-    echo "${binlogCmd} | mariadb -u root -p${DBPassword}" >> ./import-script.sh
+    echo "${binlogCmd} | mariadb -u "${DBUser}" -p${DBPassword}" >> ./import-script.sh
     echo "rm -rf /pitr" >> ./import-script.sh
     chmod +x ./import-script.sh
     docker cp ./import-script.sh "${DBContainerName}:/import-script.sh"
@@ -433,9 +433,9 @@ restore-db-local() {
   log-line msg "=== RESTORE to latest available backup (no PITR) ==="
  fi
  local backupRoot="${LocalBackupDir}/${ts}/mariadb"
- local restoreDbDir="${RestoreDir}/mariadb"
- rm -rf "${restoreDbDir}"
- mkdir -p "${restoreDbDir}"
+ local restoreDBDir="${RestoreDir}/mariadb"
+ rm -rf "${restoreDBDir}"
+ mkdir -p "${restoreDBDir}"
  local selectedFullDir="${backupRoot}/full"
  if [ ! -d "${selectedFullDir}" ]; then
   log-line err "no full backup found in ${selectedFullDir}"
@@ -453,18 +453,18 @@ restore-db-local() {
  done
  log-line msg "selected ${#selectedIncDirs[@]} incremental backup(s)"
  local fullStream="${selectedFullDir}/backup.xbstream"
- extract-xbstream "${fullStream}" "${restoreDbDir}/base"
+ extract-xbstream "${fullStream}" "${restoreDBDir}/base"
  local i
  for ((i=0; i<${#selectedIncDirs[@]}; i++)); do
   local incStream="${selectedIncDirs[i]}/backup.xbstream"
-  extract-xbstream "${incStream}" "${restoreDbDir}/_inc_${i}"
+  extract-xbstream "${incStream}" "${restoreDBDir}/_inc_${i}"
  done
  perform-restore "${isPITR}" "${targetDatetimeStr}" "${ts}"
  if [ "${?}" -ne 0 ]; then
   log-line err "there's been an error restoring the database"
   log-line err "fix the errors, then re-run restore with ${scriptName} restore-db-local \"${ts}\" \"${targetDatetimeStr}\""
  fi
- rm -rf "${restoreDbDir}"
+ rm -rf "${restoreDBDir}"
 }
 
 ###################################################################################################
