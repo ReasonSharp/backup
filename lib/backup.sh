@@ -16,7 +16,7 @@ BINLOG_UTILITY_IMAGE="bash:5.2.21-alpine3.19"
 scriptName=$(basename "${0}")
 
 dbNetworkArgs=()
-[ -n "${DbDockerNetwork}" ] && dbNetworkArgs=(--network "${DbDockerNetwork}")
+[ -n "${DBDockerNetwork}" ] && dbNetworkArgs=(--network "${DBDockerNetwork}")
 
 acquire-lock() {
  local lockFile="${1}"
@@ -37,16 +37,16 @@ release-lock() {
 }
 higher-priority-running() {
  local lockFile="${1}"
- local tmpFd
- if ! eval 'exec '{tmpFd}'>"'${lockFile}'"' 2>/dev/null; then
+ local tmpFD
+ if ! eval 'exec '{tmpFD}'>"'${lockFile}'"' 2>/dev/null; then
   return 0
  fi
- if flock -n "${tmpFd}"; then
-  eval 'exec '${tmpFd}'>&-'
+ if flock -n "${tmpFD}"; then
+  eval 'exec '${tmpFD}'>&-'
   rm -f "${lockFile}"
   return 1
  else
-  eval 'exec '${tmpFd}'>&-'
+  eval 'exec '${tmpFD}'>&-'
   return 0
  fi
 }
@@ -89,7 +89,7 @@ extract-xbstream() {
  rsync -a --delete "${streamFile}" "${tmpStream}"
  docker run --rm \
   -v "${targetDir}":/workdir \
-  "${DbBackupImage}" sh -c 'cd /workdir && mbstream -x < "'"$(basename "${streamFile}")"'"
+  "${DBBackupImage}" sh -c 'cd /workdir && mbstream -x < "'"$(basename "${streamFile}")"'"
                      chown -R '$(id -u)':'$(id -g)' /workdir'
  rm -f "${tmpStream}"
 }
@@ -114,7 +114,7 @@ wait-for-db() {
 
 bkp-db-weekly() {
  require-db-type
- require-vars DbHost DbPort DbUser DbPassword DbDataDir DbBackupImage
+ require-vars DBHost DBPort DBUser DBPassword DBDataDir DBBackupImage
  log-line msg "=== STARTING WEEKLY BACKUP ==="
  acquire-lock "${lockWeekly}" ${LOCK_FD_WEEKLY}
  terminate-lower-priority 3
@@ -133,17 +133,17 @@ bkp-db-weekly() {
  done
  mkdir -p "${fullDir}"
  if docker run --rm --name "mariadb-backup-full-${ts}" \
-               -v "${DbDataDir}":/var/lib/mysql:ro \
+               -v "${DBDataDir}":/var/lib/mysql:ro \
                -v "${fullDir}":/backup:rw \
                "${dbNetworkArgs[@]}" \
-               "${DbBackupImage}" \
+               "${DBBackupImage}" \
                bash -c 'mariadb-backup --backup \
                                        --target-dir=/backup \
                                        --stream=xbstream \
-                                       --host="'"${DbHost}"'" \
-                                       --port="'"${DbPort}"'" \
-                                       --user="'"${DbUser}"'" \
-                                       --password="'"${DbPassword}"'"
+                                       --host="'"${DBHost}"'" \
+                                       --port="'"${DBPort}"'" \
+                                       --user="'"${DBUser}"'" \
+                                       --password="'"${DBPassword}"'"
                         chown -R "'"$(id -u)":"$(id -g)"'" /backup' 2> /dev/null > "${streamFile}"; then
   log-line msg "backup file successfully created at ${streamFile}"
   if [[ -n "${prevBkp}" ]]; then
@@ -184,7 +184,7 @@ bkp-db-weekly() {
 }
 bkp-db-daily() {
  require-db-type
- require-vars DbHost DbPort DbUser DbPassword DbDataDir DbBackupImage
+ require-vars DBHost DBPort DBUser DBPassword DBDataDir DBBackupImage
  if higher-priority-running "${lockWeekly}"; then
   log-line wrn "weekly backup is running - skipping daily"
   return 1
@@ -235,19 +235,19 @@ bkp-db-daily() {
  local streamFile="${incDir}/backup.xbstream"
  mkdir -p "${incDir}"
  if docker run --rm --name "mariadb-backup-inc-${ts}" \
-               -v "${DbDataDir}":/var/lib/mysql:ro \
+               -v "${DBDataDir}":/var/lib/mysql:ro \
                -v "${extractDir}":/base:ro \
                -v "${incDir}":/backup:rw \
                "${dbNetworkArgs[@]}" \
-               "${DbBackupImage}" \
+               "${DBBackupImage}" \
                bash -c 'mariadb-backup --backup \
                                        --target-dir=/backup \
                                        --incremental-basedir=/base \
                                        --stream=xbstream \
-                                       --host="'"${DbHost}"'" \
-                                       --port="'"${DbPort}"'" \
-                                       --user="'"${DbUser}"'" \
-                                       --password="'"${DbPassword}"'"
+                                       --host="'"${DBHost}"'" \
+                                       --port="'"${DBPort}"'" \
+                                       --user="'"${DBUser}"'" \
+                                       --password="'"${DBPassword}"'"
                         chown -R "'"$(id -u)":"$(id -g)"'" /backup' > "${streamFile}" 2> /dev/null; then
   log-line msg "backup file successfully created at ${streamFile}"
   remove-extracted "${extractDir}"
@@ -266,7 +266,7 @@ bkp-db-daily() {
 }
 bkp-db-hourly() {
  require-db-type
- require-vars DbDataDir DbBinlogBasename
+ require-vars DBDataDir DBBinlogBasename
  if higher-priority-running "${lockWeekly}" || higher-priority-running "${lockDaily}"; then
   log-line wrn "higher priority backup running - skipping hourly"
   return 1
@@ -290,11 +290,11 @@ bkp-db-hourly() {
  local sinceEpoch
  sinceEpoch=$(date -d "${since:0:4}-${since:4:2}-${since:6:2} ${since:8:2}:${since:10:2}:${since:12:2}" +%s 2>/dev/null || echo 0)
  local safeSinceEpoch=$((sinceEpoch - 7200))
- if docker run --rm -v "${DbDataDir}":/var/lib/mysql:ro \
+ if docker run --rm -v "${DBDataDir}":/var/lib/mysql:ro \
                -v "${binlogDir}":/target \
                "${BINLOG_UTILITY_IMAGE}" bash -c 'cd /var/lib/mysql || exit 1
                                                files=()
-                                               for f in "'"${DbBinlogBasename}"'".[0-9]* "'"${DbBinlogBasename}"'".index; do
+                                               for f in "'"${DBBinlogBasename}"'".[0-9]* "'"${DBBinlogBasename}"'".index; do
                                                 [[ -f "${f}" ]] || continue
                                                 mtime=$(stat -c %Y "${f}" 2>/dev/null || echo 0)
                                                 if [[ "${mtime}" -ge '"${safeSinceEpoch}"' ]]; then
@@ -321,8 +321,8 @@ bkp-db-hourly() {
 ######################################## RESTORE DATABASE #########################################
 ###################################################################################################
 
-perform-restore() { # TODO: if isPitr=1, find the full backup that precedes targetDatetimeStr
- local isPitr="${1}"
+perform-restore() { # TODO: if isPITR=1, find the full backup that precedes targetDatetimeStr
+ local isPITR="${1}"
  local targetDatetimeStr="${2}"
  local ts="${3}"
  local restoreDbDir="${RestoreDir}/mariadb"
@@ -331,7 +331,7 @@ perform-restore() { # TODO: if isPitr=1, find the full backup that precedes targ
  local incDirs=($(ls -d ./_inc_* 2>/dev/null | sort))
  log-line msg "preparing backup chain (base = ${baseDir}, incrementals: ${#incDirs[@]}) ..."
  docker run --rm -v "$(pwd)/${baseDir}":/backup:rw \
-  "${DbBackupImage}" bash -c 'mariadb-backup --prepare --target-dir=/backup
+  "${DBBackupImage}" bash -c 'mariadb-backup --prepare --target-dir=/backup
                         chown -R "'"$(id -u)":"$(id -g)"'" /backup' 2> /dev/null
  local inc
  for inc in "${incDirs[@]}"; do
@@ -339,24 +339,24 @@ perform-restore() { # TODO: if isPitr=1, find the full backup that precedes targ
   incName=$(basename "${inc}")
   log-line msg "-> applying incremental ${incName}"
   docker run --rm -v "$(pwd)/${baseDir}":/base:rw -v "$(pwd)/${inc}":/inc:rw \
-   "${DbBackupImage}" bash -c 'mariadb-backup --prepare --target-dir=/base --incremental-dir=/inc
+   "${DBBackupImage}" bash -c 'mariadb-backup --prepare --target-dir=/base --incremental-dir=/inc
                          chown -R "'"$(id -u)":"$(id -g)"'" /base' 2> /dev/null
  done
  local backupEndDatetime
  backupEndDatetime=$(grep '^end_time' "${baseDir}/mariadb_backup_info" | awk -F '= ' '{gsub(/"/,"",$2); print $2}' | xargs)
  log-line msg "backup chain consistent as of: ${backupEndDatetime}"
  log-line msg "stopping MariaDB container..."
- docker stop "${DbContainerName}" || true
- log-line msg "saving corrupted/current data dir -> ${DbDataDir}-corrupted-$(date -u +"%Y%m%d%H%M%S")"
- mv "${DbDataDir}" "${DbDataDir}-corrupted-$(date -u +"%Y%m%d%H%M%S")"
- mkdir -p "${DbDataDir}"
+ docker stop "${DBContainerName}" || true
+ log-line msg "saving corrupted/current data dir -> ${DBDataDir}-corrupted-$(date -u +"%Y%m%d%H%M%S")"
+ mv "${DBDataDir}" "${DBDataDir}-corrupted-$(date -u +"%Y%m%d%H%M%S")"
+ mkdir -p "${DBDataDir}"
  log-line msg "copying back data from backup..."
- docker run --rm -v "${DbDataDir}":/var/lib/mysql:rw -v "$(pwd)/${baseDir}":/backup:ro \
-  "${DbBackupImage}" mariadb-backup --copy-back --target-dir=/backup --datadir=/var/lib/mysql 2> /dev/null
+ docker run --rm -v "${DBDataDir}":/var/lib/mysql:rw -v "$(pwd)/${baseDir}":/backup:ro \
+  "${DBBackupImage}" mariadb-backup --copy-back --target-dir=/backup --datadir=/var/lib/mysql 2> /dev/null
  log-line msg "starting MariaDB container..."
- docker start "${DbContainerName}"
- wait-for-db "${DbContainerName}" root "${DbPassword}"
- if [ "${isPitr}" = "1" ] && [[ "${backupEndDatetime}" < "${targetDatetimeStr}" ]]; then
+ docker start "${DBContainerName}"
+ wait-for-db "${DBContainerName}" root "${DBPassword}"
+ if [ "${isPITR}" = "1" ] && [[ "${backupEndDatetime}" < "${targetDatetimeStr}" ]]; then
   log-line msg "applying binary logs from ${backupEndDatetime} -> ${targetDatetimeStr}..."
   local pitrDir
   pitrDir=$(mktemp -d)
@@ -365,7 +365,7 @@ perform-restore() { # TODO: if isPitr=1, find the full backup that precedes targ
   if [ "${?}" -ne 0 ]; then
    log-line msg "failed to copy binary logs to PITR folder"
   else
-   local binlogFiles=($(ls "${pitrDir}"/"${DbBinlogBasename}".* 2>/dev/null | grep -v ".idx" | grep -v ".index" | sort))
+   local binlogFiles=($(ls "${pitrDir}"/"${DBBinlogBasename}".* 2>/dev/null | grep -v ".idx" | grep -v ".index" | sort))
    if [ ${#binlogFiles[@]} -gt 0 ]; then
     local binlogPosFile="${restoreDbDir}/base/mariadb_backup_binlog_info"
     local startFile
@@ -388,13 +388,13 @@ perform-restore() { # TODO: if isPitr=1, find the full backup that precedes targ
     binlogCmd="${binlogCmd} --stop-datetime=\"${targetDatetimeStr}\""
     log-line msg "executing: ${binlogCmd} | mariadb"
     echo '#!/bin/bash' > ./import-script.sh
-    echo "${binlogCmd} | mariadb -u root -p${DbPassword}" >> ./import-script.sh
+    echo "${binlogCmd} | mariadb -u root -p${DBPassword}" >> ./import-script.sh
     echo "rm -rf /pitr" >> ./import-script.sh
     chmod +x ./import-script.sh
-    docker cp ./import-script.sh "${DbContainerName}:/import-script.sh"
-    docker cp "${pitrDir}" "${DbContainerName}:/pitr"
-    docker exec "${DbContainerName}" /import-script.sh
-    docker exec "${DbContainerName}" rm -rf /import-script.sh /pitr
+    docker cp ./import-script.sh "${DBContainerName}:/import-script.sh"
+    docker cp "${pitrDir}" "${DBContainerName}:/pitr"
+    docker exec "${DBContainerName}" /import-script.sh
+    docker exec "${DBContainerName}" rm -rf /import-script.sh /pitr
     rm ./import-script.sh
     log-line msg "binary logs applied successfully"
    else
@@ -403,7 +403,7 @@ perform-restore() { # TODO: if isPitr=1, find the full backup that precedes targ
   fi
   rm -rf "${pitrDir}"
  else
-  if [ "${isPitr}" = "1" ]; then
+  if [ "${isPITR}" = "1" ]; then
    log-line msg "target time (${targetDatetimeStr}) is not after backup end time (${backupEndDatetime}) -> no binlog apply needed"
   fi
  fi
@@ -412,14 +412,14 @@ perform-restore() { # TODO: if isPitr=1, find the full backup that precedes targ
 
 restore-db-local() {
  require-db-type
- require-vars DbDataDir DbContainerName DbPassword DbBackupImage DbBinlogBasename
+ require-vars DBDataDir DBContainerName DBPassword DBBackupImage DBBinlogBasename
  local ts="${1}"
  local targetDatetimeStr="${2}"
  if [ -z "${ts}" ]; then
   log-line err "usage: ${scriptName} restore-db-local <timestamp> [target-datetime]"
   return 1
  fi
- local isPitr=0
+ local isPITR=0
  local targetTs="99999999999999"
  if [ -n "${targetDatetimeStr}" ]; then
   if ! date -d "${targetDatetimeStr}" >/dev/null 2>&1; then
@@ -427,7 +427,7 @@ restore-db-local() {
    return 1
   fi
   targetTs=$(date -d "${targetDatetimeStr}" +"%Y%m%d%H%M%S")
-  isPitr=1
+  isPITR=1
   log-line msg "=== POINT-IN-TIME RESTORE to ${targetDatetimeStr} ==="
  else
   log-line msg "=== RESTORE to latest available backup (no PITR) ==="
@@ -459,7 +459,7 @@ restore-db-local() {
   local incStream="${selectedIncDirs[i]}/backup.xbstream"
   extract-xbstream "${incStream}" "${restoreDbDir}/_inc_${i}"
  done
- perform-restore "${isPitr}" "${targetDatetimeStr}" "${ts}"
+ perform-restore "${isPITR}" "${targetDatetimeStr}" "${ts}"
  if [ "${?}" -ne 0 ]; then
   log-line err "there's been an error restoring the database"
   log-line err "fix the errors, then re-run restore with ${scriptName} restore-db-local \"${ts}\" \"${targetDatetimeStr}\""
@@ -521,7 +521,7 @@ restore-folders-local() {
 
 bkp-to-cloud() {
  require-cloud-provider
- require-vars GcsBucket AesPassphrase BackupInstanceName
+ require-vars GCSBucket AESPassphrase BackupInstanceName
  local ts="${1}"
  local level="${2}"
  if [ -z "${ts}" ] || [ -z "${level}" ]; then
@@ -532,16 +532,16 @@ bkp-to-cloud() {
  local archivePath="/tmp/${archiveName}"
  local encryptedPath="${archivePath}.aes256"
  tar -cvjf "${archivePath}" -C "${LocalBackupDir}/${ts}" . 2>/dev/null 2>&1
- export PASSPHRASE="${AesPassphrase}"
+ export PASSPHRASE="${AESPassphrase}"
  openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -in "${archivePath}" -out "${encryptedPath}" -pass env:PASSPHRASE
- local cloudPath="gs://${GcsBucket}/${archiveName}.aes256"
+ local cloudPath="gs://${GCSBucket}/${archiveName}.aes256"
  if gcloud storage ls "${cloudPath}" >/dev/null 2>&1; then
   gcloud storage rm "${cloudPath}" 2>/dev/null || true
  fi
  gcloud storage cp "${encryptedPath}" "${cloudPath}"
  if [ "${?}" -eq 0 ]; then
   if [ "${level}" = "weekly" ]; then
-   gcloud storage rm -q "gs://${GcsBucket}/daily-backup.${BackupInstanceName}.*.tar.bz2.aes256" 2>/dev/null || true
+   gcloud storage rm -q "gs://${GCSBucket}/daily-backup.${BackupInstanceName}.*.tar.bz2.aes256" 2>/dev/null || true
   fi
   rm -f "${encryptedPath}"
  else
@@ -553,7 +553,7 @@ bkp-to-cloud() {
 }
 restore-from-cloud() {
  require-cloud-provider
- require-vars GcsBucket AesPassphrase BackupInstanceName
+ require-vars GCSBucket AESPassphrase BackupInstanceName
  local targetDatetime="${1}"
  local ts
  ts=$(date -u +"%Y%m%d%H%M%S")
@@ -565,7 +565,7 @@ restore-from-cloud() {
   return 1
  fi
  local candidates
- candidates=$(gcloud storage ls "gs://${GcsBucket}/*-backup.${BackupInstanceName}.*.tar.bz2.aes256" 2>/dev/null | grep -E ".*-backup\.${BackupInstanceName}\.[0-9]{14}\.tar\.bz2\.aes256$")
+ candidates=$(gcloud storage ls "gs://${GCSBucket}/*-backup.${BackupInstanceName}.*.tar.bz2.aes256" 2>/dev/null | grep -E ".*-backup\.${BackupInstanceName}\.[0-9]{14}\.tar\.bz2\.aes256$")
  if [[ -z "${candidates}" ]]; then
   log-line err "no backups found before '${targetDatetime}'"
   return 1
@@ -595,7 +595,7 @@ restore-from-cloud() {
   log-line err "failed to download backup from cloud"
   return 1
  fi
- export PASSPHRASE="${AesPassphrase}"
+ export PASSPHRASE="${AESPassphrase}"
  if ! openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in "${localEncryptedPath}" -out "${RestoreDir}/downloaded-backup.tar.bz2" -pass env:PASSPHRASE; then
   log-line err "decryption failed (incorrect passphrase?)"
   rm -f "${localEncryptedPath}"

@@ -45,7 +45,7 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
    - backs up the folders configured in ${BOLD}BackupFolders${RESET} to ${BOLD}\${LocalBackupDir}/<timestamp>/files${RESET}
 
   ${BOLD}bkp-to-cloud${RESET} <timestamp> <weekly|daily>
-   - archives everything in ${BOLD}\${LocalBackupDir}/<timestamp>${RESET} to a bzip2 archive, encrypts it with ${BOLD}aes-256-cbc${RESET} using ${BOLD}AesPassphrase${RESET}, and uploads it to ${BOLD}gs://\${GcsBucket}/${RESET}
+   - archives everything in ${BOLD}\${LocalBackupDir}/<timestamp>${RESET} to a bzip2 archive, encrypts it with ${BOLD}aes-256-cbc${RESET} using ${BOLD}AESPassphrase${RESET}, and uploads it to ${BOLD}gs://\${GCSBucket}/${RESET}
    - if upload to cloud fails, moves the encrypted archive to ${BOLD}\${RestoreDir}${RESET}
 
   ${BOLD}restore-db-local${RESET} <timestamp> [target-datetime]
@@ -56,7 +56,7 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
    - restores the folders configured in ${BOLD}BackupFolders${RESET} from ${BOLD}\${LocalBackupDir}/<timestamp>/files${RESET}
 
   ${BOLD}restore-from-cloud${RESET} [target-datetime]
-   - restores the most recent encrypted archive at or before ${BOLD}[target-datetime]${RESET} (format: yyyy-MM-dd HH:mm:ss, default: now) from ${BOLD}gs://\${GcsBucket}/${RESET}, decrypts it, extracts it, and moves the files into ${BOLD}\${LocalBackupDir}${RESET}
+   - restores the most recent encrypted archive at or before ${BOLD}[target-datetime]${RESET} (format: yyyy-MM-dd HH:mm:ss, default: now) from ${BOLD}gs://\${GCSBucket}/${RESET}, decrypts it, extracts it, and moves the files into ${BOLD}\${LocalBackupDir}${RESET}
 
   ${BOLD}install-cron${RESET}
    - installs weekly/daily/hourly backups as cron jobs, per the ${BOLD}Cron*${RESET} schedule in ${BOLD}.env${RESET}
@@ -94,10 +94,10 @@ if [ -f "${envFile}" ]; then
  set +a
 fi
 
-[ -z "${DbType}" ] && DbType="mariadb"
-[ -z "${DbPort}" ] && DbPort=3306
-[ -z "${DbContainerName}" ] && DbContainerName="database"
-[ -z "${DbBackupImage}" ] && DbBackupImage="mariadb:11.8"
+[ -z "${DBType}" ] && DBType="mariadb"
+[ -z "${DBPort}" ] && DBPort=3306
+[ -z "${DBContainerName}" ] && DBContainerName="database"
+[ -z "${DBBackupImage}" ] && DBBackupImage="mariadb:11.8"
 [ -z "${LocalBackupDir}" ] && LocalBackupDir="${scriptDir}/backups"
 [ -z "${RestoreDir}" ] && RestoreDir="${scriptDir}/restored-backup"
 [ -z "${CloudProvider}" ] && CloudProvider="gcloud"
@@ -108,7 +108,7 @@ fi
 [ -z "${LogFile}" ] && LogFile="${scriptDir}/logs/backup.log"
 
 set -a
-export DbType DbPort DbContainerName DbBackupImage LocalBackupDir RestoreDir CloudProvider BackupInstanceName CronWeekly CronDaily CronHourly LogFile
+export DBType DBPort DBContainerName DBBackupImage LocalBackupDir RestoreDir CloudProvider BackupInstanceName CronWeekly CronDaily CronHourly LogFile
 set +a
 
 envsubst < "${envTemplate}" > "${envFile}"

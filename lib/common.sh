@@ -26,8 +26,8 @@ require-vars() {
 }
 
 require-db-type() {
- if [ "${DbType}" != "mariadb" ]; then
-  log-line err "unsupported DbType '${DbType}' (only 'mariadb' is supported for now)"
+ if [ "${DBType}" != "mariadb" ]; then
+  log-line err "unsupported DBType '${DBType}' (only 'mariadb' is supported for now)"
   exit 1
  fi
 }
