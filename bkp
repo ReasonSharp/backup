@@ -1,0 +1,141 @@
+#!/bin/bash
+
+if [[ -t 1 ]]; then
+ BOLD=$(tput bold 2>/dev/null || echo '')
+ RED=$(tput setaf 1)
+ YELLOW=$(tput setaf 3)
+ CYAN=$(tput setaf 6)
+ RESET=$(tput sgr0)
+else
+ BOLD=
+ RED=
+ YELLOW=
+ CYAN=
+ RESET=
+fi
+
+show-help() {
+ cat <<EOF
+usage: ${BOLD}${0} <command> [params...]${RESET}
+
+ ${CYAN}=================${RESET}
+ ${CYAN}= Backup/restore =${RESET}
+ ${CYAN}=================${RESET}
+
+  ${BOLD}bkp-db-weekly${RESET}
+   - performs a weekly (full) backup of the database
+   - any existing lower-priority backup processes (daily or hourly) will be terminated
+   - the backup archive is stored locally in ${BOLD}\${LocalBackupDir}/<timestamp>/mariadb/full${RESET}
+
+  ${BOLD}bkp-db-daily${RESET} [timestamp]
+   - performs a daily (incremental) backup of the database, appending to the latest full backup, or one specified by ${BOLD}[timestamp]${RESET}
+   - if a weekly backup is running, this will do nothing
+   - if an hourly backup is running it will be terminated before the daily backup starts
+   - if there are no previous full backups, this runs ${BOLD}bkp-db-weekly${RESET} and then exits
+   - also runs ${BOLD}bkp-folders${RESET} for the same timestamp
+   - the backup stream is stored locally in ${BOLD}\${LocalBackupDir}/<timestamp>/mariadb/inc_yyyyMMddHHmmss${RESET}
+
+  ${BOLD}bkp-db-hourly${RESET} [timestamp]
+   - performs an hourly (binlog) backup, starting from the binlog active during the last full backup, or the one specified by ${BOLD}[timestamp]${RESET}
+   - if any higher priority backup process (weekly or daily) is running, this will do nothing
+   - if there are no previous full backups, this will do nothing
+   - the binlogs are stored locally in ${BOLD}\${LocalBackupDir}/<timestamp>/mariadb/binlogs${RESET}
+
+  ${BOLD}bkp-folders${RESET} <timestamp>
+   - backs up the folders configured in ${BOLD}BackupFolders${RESET} to ${BOLD}\${LocalBackupDir}/<timestamp>/files${RESET}
+
+  ${BOLD}bkp-to-cloud${RESET} <timestamp> <weekly|daily>
+   - archives everything in ${BOLD}\${LocalBackupDir}/<timestamp>${RESET} to a bzip2 archive, encrypts it with ${BOLD}aes-256-cbc${RESET} using ${BOLD}AesPassphrase${RESET}, and uploads it to ${BOLD}gs://\${GcsBucket}/${RESET}
+   - if upload to cloud fails, moves the encrypted archive to ${BOLD}\${RestoreDir}${RESET}
+
+  ${BOLD}restore-db-local${RESET} <timestamp> [target-datetime]
+   - restores the database from a local backup with the given ${BOLD}timestamp${RESET} in ${BOLD}\${LocalBackupDir}${RESET}
+   - if ${BOLD}[target-datetime]${RESET} (format: yyyy-MM-dd HH:mm:ss) is given, performs a point-in-time restore using the archived binlogs
+
+  ${BOLD}restore-folders-local${RESET} <timestamp>
+   - restores the folders configured in ${BOLD}BackupFolders${RESET} from ${BOLD}\${LocalBackupDir}/<timestamp>/files${RESET}
+
+  ${BOLD}restore-from-cloud${RESET} [target-datetime]
+   - restores the most recent encrypted archive at or before ${BOLD}[target-datetime]${RESET} (format: yyyy-MM-dd HH:mm:ss, default: now) from ${BOLD}gs://\${GcsBucket}/${RESET}, decrypts it, extracts it, and moves the files into ${BOLD}\${LocalBackupDir}${RESET}
+
+  ${BOLD}install-cron${RESET}
+   - installs weekly/daily/hourly backups as cron jobs, per the ${BOLD}Cron*${RESET} schedule in ${BOLD}.env${RESET}
+   - backup to cloud runs automatically after each weekly and daily backup
+
+  ${BOLD}help${RESET} | ${BOLD}""${RESET} | ${BOLD}-h${RESET} | ${BOLD}--help${RESET}
+   - displays this help message
+EOF
+}
+
+get-script-dir() {
+ local srcPath="${BASH_SOURCE[0]}"
+ local symPath
+ local scrPath
+ while [ -L "${srcPath}" ]; do
+  symPath="$( cd -P "$( dirname "${srcPath}" )" >/dev/null 2>&1 && pwd )"
+  srcPath="$(readlink "${srcPath}")"
+  if [[ ${srcPath} != /* ]]; then
+   srcPath=${symPath}/${srcPath}
+  fi
+ done
+ scrPath="$(cd -P "$( dirname "${srcPath}" )" >/dev/null 2>&1 && pwd)"
+ echo "${scrPath}"
+}
+
+scriptDir=$(get-script-dir)
+export scriptDir
+
+envFile="${scriptDir}/.env"
+envTemplate="${scriptDir}/.env.template"
+
+if [ -f "${envFile}" ]; then
+ set -a
+ . "${envFile}"
+ set +a
+fi
+
+[ -z "${DbType}" ] && DbType="mariadb"
+[ -z "${DbPort}" ] && DbPort=3306
+[ -z "${DbContainerName}" ] && DbContainerName="database"
+[ -z "${DbBackupImage}" ] && DbBackupImage="mariadb:11.8"
+[ -z "${LocalBackupDir}" ] && LocalBackupDir="${scriptDir}/backups"
+[ -z "${RestoreDir}" ] && RestoreDir="${scriptDir}/restored-backup"
+[ -z "${CloudProvider}" ] && CloudProvider="gcloud"
+[ -z "${BackupInstanceName}" ] && BackupInstanceName="default"
+[ -z "${CronWeekly}" ] && CronWeekly="0 0 * * 0"
+[ -z "${CronDaily}" ] && CronDaily="0 2 * * 1-6"
+[ -z "${CronHourly}" ] && CronHourly="30 * * * *"
+[ -z "${LogFile}" ] && LogFile="${scriptDir}/logs/backup.log"
+
+set -a
+export DbType DbPort DbContainerName DbBackupImage LocalBackupDir RestoreDir CloudProvider BackupInstanceName CronWeekly CronDaily CronHourly LogFile
+set +a
+
+envsubst < "${envTemplate}" > "${envFile}"
+
+mkdir -p "${LocalBackupDir}" "${RestoreDir}" "$(dirname "${LogFile}")"
+
+. "${scriptDir}/lib/common.sh"
+. "${scriptDir}/lib/backup.sh"
+
+cmd="${1}"
+shift
+
+case "${cmd}" in
+ bkp-db-weekly)         bkp-db-weekly;;
+ bkp-db-daily)          bkp-db-daily "${@}";;
+ bkp-db-hourly)         bkp-db-hourly "${@}";;
+ bkp-folders)           bkp-folders "${@}";;
+ bkp-to-cloud)          bkp-to-cloud "${@}";;
+ restore-db-local)      restore-db-local "${@}";;
+ restore-folders-local) restore-folders-local "${@}";;
+ restore-from-cloud)    restore-from-cloud "${@}";;
+ install-cron)          install-cron;;
+ help|""|-h|--help)
+  show-help
+  exit 0;;
+ *)
+  echo "${0}: unknown command '${cmd}'" >&2
+  show-help
+  exit 1;;
+esac
