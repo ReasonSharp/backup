@@ -110,7 +110,7 @@ fi
 # set defaults, overwrite by values already set in .env by user, then recreate .env with values already loaded + any non-overwritten defaults
 set -a
 export DBType DBPort DBContainerName DBBackupImage LocalBackupDir RestoreDir CloudProvider BackupInstanceName CronWeekly CronDaily CronHourly LogFile
-. ${scriptDir}/.env
+[ -f "${envFile}" ] && . "${envFile}"
 set +a
 envsubst < "${envTemplate}" > "${envFile}"
 
