@@ -133,6 +133,7 @@ bkp-db-weekly() {
  done
  mkdir -p "${fullDir}"
  if docker run --rm --name "mariadb-backup-full-${ts}" \
+               --log-driver none \
                -v "${DBDataDir}":/var/lib/mysql:ro \
                -v "${fullDir}":/backup:rw \
                "${dbNetworkArgs[@]}" \
@@ -235,6 +236,7 @@ bkp-db-daily() {
  local streamFile="${incDir}/backup.xbstream"
  mkdir -p "${incDir}"
  if docker run --rm --name "mariadb-backup-inc-${ts}" \
+               --log-driver none \
                -v "${DBDataDir}":/var/lib/mysql:ro \
                -v "${extractDir}":/base:ro \
                -v "${incDir}":/backup:rw \
