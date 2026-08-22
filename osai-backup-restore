@@ -1,0 +1,622 @@
+#!/bin/bash
+
+backupsDir="${datadir}/backups"
+restoreDir="${datadir}/restored-backup"
+modelsRoot="${scriptdir}/models/inference"
+
+stateFile="${backupsDir}/.backup-state"
+
+lockWeekly="${scriptdir}/weekly.lock"
+lockDaily="${scriptdir}/daily.lock"
+lockHourly="${scriptdir}/hourly.lock"
+
+lockFDWeekly=200
+lockFDDaily=201
+lockFDHourly=202
+
+log-line() {
+ local lvl="${1}"
+ local line="${2}"
+ echo "[$(date +"%Y-%m-%d %H:%M:%S")] (${lvl}): ${line}"
+}
+
+acquire-lock() {
+ local lockfile="${1}"
+ local fd="${2}"
+ touch "${lockfile}"
+ eval 'exec '${fd}'>"'${lockfile}'"'
+ if ! flock -n "${fd}"; then
+  log-line err "another backup process is already running (${lockfile}) - exiting"
+  exit 1
+ fi
+ trap 'eval exec '${fd}'>&-; rm -f "'"${lockfile}"'"' EXIT
+}
+release-lock() {
+ local lockfile="${1}"
+ local fd="${2}"
+ eval "exec ${fd}>&-"
+ rm -f "${lockfile}"
+}
+higher-priority-running() {
+ local lockfile="${1}"
+ local tmpfd
+ if ! eval 'exec '{tmpfd}'>"'${lockfile}'"' 2>/dev/null; then
+  return 0
+ fi
+ if flock -n "${tmpfd}"; then
+  eval 'exec '${tmpfd}'>&-'
+  rm -f "${lockfile}"
+  return 1
+ else
+  eval 'exec '${tmpfd}'>&-'
+  return 0
+ fi
+}
+terminate-lower-priority() {
+ local mylevel="${1}"
+ for pid in $(pgrep -f "osai bkp-db-(hourly|daily|weekly)" | grep -v ${$}); do
+  if grep -q "bkp-db-hourly" /proc/${pid}/cmdline 2>/dev/null && [ "${mylevel}" -gt 1 ]; then
+   kill ${pid} 2>/dev/null || true
+   docker run --rm \
+    -v "${backupsDir}":/workdir \
+    alpine:3.22 sh -c 'chown -R '$(id -u)':'$(id -g)' /workdir'
+  fi
+  if grep -q "bkp-db-daily" /proc/${pid}/cmdline 2>/dev/null && [ "${mylevel}" -gt 2 ]; then
+   kill ${pid} 2>/dev/null || true
+   docker run --rm \
+    -v "${backupsDir}":/workdir \
+    alpine:3.22 sh -c 'chown -R '$(id -u)':'$(id -g)' /workdir'
+  fi
+ done
+}
+
+load-state() {
+ if [[ -f "${stateFile}" ]]; then
+  source "${stateFile}"
+ else
+  last_full_ts=""; last_inc_ts=""
+ fi
+}
+
+save-state() {
+ cat > "${stateFile}" <<EOF
+last_full_ts="${last_full_ts}"
+last_inc_ts="${last_inc_ts}"
+EOF
+ chmod 600 "${stateFile}"
+}
+
+extract_xbstream() {
+ local stream_file="${1}"
+ local target_dir="${2}"
+ log-line msg "extracting ${stream_file} → ${target_dir}"
+ local tstream="${target_dir}"/$(basename "${stream_file}")
+ mkdir -p "${target_dir}"
+ rsync -a --delete "${stream_file}" "${tstream}"
+ docker run --rm \
+  -v "${target_dir}":/workdir \
+  mariadb:11.8 sh -c 'cd /workdir && mbstream -x < "'"$(basename "${stream_file}")"'"
+                      chown -R '$(id -u)':'$(id -g)' /workdir'
+ rm -f "${tstream}"
+}
+remove-extracted() {
+ docker run --rm -v "$(dirname "${1}")":/workdir:rw alpine:3.22 rm -rf /workdir/$(basename "${1}")
+}
+
+wait_for_db() {
+ container="${1}"
+ user="${2}"
+ pass="${3}"
+ until docker exec "${container}" mariadb -u"${user}" -p"${pass}" -e "SELECT 1" >/dev/null 2>&1; do
+  log-line msg "waiting for MariaDB to be ready..."
+  sleep 1
+ done
+ log-line msg "MariaDB is ready"
+}
+
+###################################################################################################
+######################################### BACKUP DATABASE #########################################
+###################################################################################################
+
+bkp-db-weekly() {
+ log-line msg "=== STARTING WEEKLY BACKUP ==="
+ acquire-lock "${lockWeekly}" ${lockFDWeekly}
+ terminate-lower-priority 3
+ local ts=$(date -u +"%Y%m%d%H%M%S")
+ local bkproot="${backupsDir}/${ts}/mariadb"
+ local fulldir="${bkproot}/full"
+ local streamf="${fulldir}/backup.xbstream"
+ local prevbkp=""
+ for d in $(find "${backupsDir}" -mindepth 1 -maxdepth 1 -type d -name '[0-9][0-9][0-9][0-9][0-1][0-9][0-3][0-9][0-2][0-9][0-5][0-9][0-5][0-9]' | sort -r); do
+  if [[ "$(basename "${d}")" < "${ts}" ]]; then
+   prevbkp="$(basename "${d}")"
+   break
+  fi
+ done
+ mkdir -p "${fulldir}"
+ if docker run --rm --name "mariadb-backup-full-${ts}" \
+               -v "${dbdir}":/var/lib/mysql:ro \
+               -v "${fulldir}":/backup:rw \
+               --network os \
+               mariadb:11.8 \
+               bash -c 'mariadb-backup --backup \
+                                       --target-dir=/backup \
+                                       --stream=xbstream \
+                                       --host="'"${DB_HOST}"'" \
+                                       --port="'"${DB_PORT}"'" \
+                                       --user="'"${DB_USER}"'" \
+                                       --password="'"${DB_PASSWORD}"'"
+                        chown -R "'"$(id -u)":"$(id -g)"'" /backup' 2> /dev/null > "${streamf}"; then
+  log-line msg "backup file successfully created at ${streamf}"
+  if [[ -n "${prevbkp}" ]]; then
+   release-lock "${lockWeekly}" "${lockFDWeekly}"
+   bkp-db-daily "${prevbkp}"
+   if [ "${?}" -gt 0 ]; then
+    log-line err "failed to append previous week - please run '${0} bkp-db-daily \"${prevbkp}\"' manually"
+    exit 1
+   fi
+   release-lock "${lockDaily}" "${lockFDDaily}"
+   bkp-db-hourly "${prevbkp}"
+   if [ "${?}" -gt 0 ]; then
+    log-line err "failed to append previous week - please run '${0} bkp-db-hourly \"${prevbkp}\"' manually"
+    exit 1
+   fi
+   log-line msg "appended daily incremental and binlogs to previous backup archive (${prevbkp}) - ready for sending to cloud"
+  else
+   log-line msg "no previous full backup found - skipped daily incremental and binlog append"
+  fi
+  last_full_ts="$ts"
+  last_inc_ts=""
+  save-state
+  if [[ -n "${prevbkp}" ]]; then
+   bkp-to-cloud "${prevbkp}" "weekly"
+   if [ "${?}" -eq 0 ]; then
+    rm -rf "${backupsDir}/${prevbkp}"
+   else
+    log-line wrn "couldn't upload previous week's backups to cloud (${backupsDir}/${prevbkp})"
+   fi
+  fi
+  bkp-to-cloud "${ts}" "daily"
+  log-line msg "=== WEEKLY BACKUP COMPLETED ==="
+ else
+  rm -rf "${fulldir}"
+  log-line err "weekly backup failed with code ${?}"
+  return 1
+ fi
+}
+bkp-db-daily() {
+ if higher-priority-running "${lockWeekly}"; then
+  log-line wrn "weekly backup is running - skipping daily"
+  return 1
+ fi
+ log-line msg "=== STARTING DAILY BACKUP ==="
+ acquire-lock "${lockDaily}" ${lockFDDaily}
+ terminate-lower-priority 2
+ load-state
+ local fullts="${last_full_ts}"
+ if [[ -z "${fullts}" ]] && [[ -z "${1}" ]]; then
+  log-line err "no valid full backup found and no parameter is given - falling back to full backup"
+  bkp-db-weekly
+  rm -f "${lockDaily}"
+  return ${?}
+ elif [[ -n "${1}" ]]; then
+  fullts="${1}"
+ fi
+ local bkproot="${backupsDir}/${fullts}/mariadb"
+ if [[ ! -f "${bkproot}/full/backup.xbstream" ]]; then
+  log-line err "no full backup found for ${fullts} - error in ${stateFile}?"
+  return 1
+ fi
+ local ts=$(date -u +"%Y%m%d%H%M%S")
+ local incdir="${bkproot}/inc_${ts}"
+ local lastfull=$(ls -d "${bkproot}"/full)
+ local selected_full_ts="${fullts}"
+ local inc_dirs=($(ls -d "${bkproot}"/inc_* 2>/dev/null | sort))
+ local selected_inc_dirs=()
+ local maxincts="00010101-000000"
+ for dir in "${inc_dirs[@]}"; do
+  local its=${dir##*/inc_}
+  if [[ "${its}" > "${selected_full_ts}" ]] && [[ "${its}" < "${ts}" || "${its}" == "${ts}" ]]; then
+   if [[ "${its}" > "${maxincts}" ]]; then
+    maxincts="${its}"
+   fi
+  fi
+ done
+ if [ "${maxincts}" != "00010101-000000" ]; then
+  lastfull="${bkproot}/inc_${maxincts}"
+  log-line msg "found incremental backup at ${lastfull}"
+ fi
+ local laststream="${lastfull}/backup.xbstream"
+ local extractDir=$(mktemp -d)
+ extract_xbstream "${laststream}" "${extractDir}"
+ local streamf="${incdir}/backup.xbstream"
+ mkdir -p "${incdir}"
+ if docker run --rm --name "mariadb-backup-inc-${ts}" \
+               -v "${dbdir}":/var/lib/mysql:ro \
+               -v "${extractDir}":/base:ro \
+               -v "${incdir}":/backup:rw \
+               --network os \
+               mariadb:11.8 \
+               bash -c 'mariadb-backup --backup \
+                                       --target-dir=/backup \
+                                       --incremental-basedir=/base \
+                                       --stream=xbstream \
+                                       --host="'"${DB_HOST}"'" \
+                                       --port="'"${DB_PORT}"'" \
+                                       --user="'"${DB_USER}"'" \
+                                       --password="'"${DB_PASSWORD}"'"
+                        chown -R "'"$(id -u)":"$(id -g)"'" /backup' > "${streamf}" 2> /dev/null; then
+  log-line msg "backup file successfully created at ${streamf}"
+  remove-extracted "${extractDir}"
+  last_inc_ts="${ts}"
+  save-state
+  if [[ -z "${1}" ]]; then
+   bkp-to-cloud "${fullts}" "daily"
+  fi
+  log-line msg "=== DAILY BACKUP COMPLETED ==="
+ else
+  log-line err "daily backup failed with code ${?}"
+  rm -rf "${incdir}"
+  return 1
+ fi
+ bkp-models "${fullts}"
+}
+bkp-db-hourly() {
+ if higher-priority-running "${lockWeekly}" || higher-priority-running "${lockDaily}"; then
+  log-line wrn "higher priority backup running - skipping hourly"
+  return 1
+ fi
+ log-line msg "=== STARTING HOURLY BACKUP ==="
+ acquire-lock "${lockHourly}" ${lockFDHourly}
+ load-state
+ local fullts="${last_full_ts}"
+ if [[ -z "${fullts}" ]] && [[ -z "${1}" ]]; then
+  log-line wrn "no full backup exists yet - skipping binlog backup"
+  return 0
+ elif [[ -n "${1}" ]]; then
+  fullts="${1}"
+ fi
+ local ts=$(date -u +"%Y%m%d%H%M%S")
+ local bld="${backupsDir}/${fullts}/mariadb/binlogs"
+ mkdir -p "${bld}"
+ local since="${fullts}"
+ if [[ -z "${since}" ]]; then
+  log-line msg "no reference timestamp - skipping binlog backup"
+  return 0
+ else
+  log-line msg "archiving binlogs newer than ${since}"
+ fi
+ local since_epoch=$(date -d "${since:0:4}-${since:4:2}-${since:6:2} ${since:8:2}:${since:10:2}:${since:12:2}" +%s 2>/dev/null || echo 0)
+ local safe_since_epoch=$((since_epoch - 7200))
+ if docker run --rm -v "${dbdir}":/var/lib/mysql:ro \
+               -v "${bld}":/target \
+               bash:5.2.21-alpine3.19 bash -c 'cd /var/lib/mysql || exit 1
+                                               files=()
+                                               for f in os-bin.[0-9]* os-bin.index; do
+                                                [[ -f "${f}" ]] || continue
+                                                mtime=$(stat -c %Y "${f}" 2>/dev/null || echo 0)
+                                                if [[ "${mtime}" -ge '"${safe_since_epoch}"' ]]; then
+                                                 files+=("${f}")
+                                                fi
+                                               done
+                                               if [ ${#files[@]} -eq 0 ]; then
+                                                echo "'"$(log-line msg "nothing to backup")"'"
+                                                exit 0
+                                               fi
+                                               for f in ${files[@]}; do
+                                                cp "${f}" /target/
+                                               done
+                                               chown '$(id -u)':'$(id -g)' "/target/"*'; then
+  log-line msg "binlogs successfully copied to ${bld}/"
+  log-line msg "=== HOURLY BACKUP COMPLETED ==="
+ else
+  log-line err "hourly backup failed with code ${?}"
+  return 1
+ fi
+}
+
+###################################################################################################
+######################################## RESTORE DATABASE #########################################
+###################################################################################################
+
+perform_restore() { # TODO: ako je is_pitr=1 onda treba naci full backup koji je prije target_datetime_str
+ local is_pitr="${1}"
+ local target_datetime_str="${2}"
+ local ts="${3}"
+ local restore_dir="${restoreDir}/mariadb"
+ cd "${restore_dir}" || { log-line err "cannot cd to ${restore_dir}"; return 1; }
+ local base_dir="./base"
+ local inc_dirs=($(ls -d ./_inc_* 2>/dev/null | sort))
+ log-line msg "preparing backup chain (base = ${base_dir}, incrementals: ${#inc_dirs[@]}) ..."
+ docker run --rm -v "$(pwd)/${base_dir}":/backup:rw \
+  mariadb:11.8 bash -c 'mariadb-backup --prepare --target-dir=/backup
+                        chown -R "'"$(id -u)":"$(id -g)"'" /backup' 2> /dev/null
+ for inc in "${inc_dirs[@]}"; do
+  local inc_name=$(basename "${inc}")
+  log-line msg "→ Applying incremental ${inc_name}"
+  docker run --rm -v "$(pwd)/${base_dir}":/base:rw -v "$(pwd)/${inc}":/inc:rw \
+   mariadb:11.8 bash -c 'mariadb-backup --prepare --target-dir=/base --incremental-dir=/inc
+                         chown -R "'"$(id -u)":"$(id -g)"'" /base' 2> /dev/null
+ done
+ local backup_end_datetime=$(grep '^end_time' "${base_dir}/mariadb_backup_info" | awk -F '= ' '{gsub(/"/,"",$2); print $2}' | xargs)
+ log-line msg "backup chain consistent as of: ${backup_end_datetime}"
+ log-line msg "stopping MariaDB container..."
+ docker stop database || true
+ log-line msg "saving corrupted/current dbdir → ${dbdir}-corrupted-$(date -u +"%Y%m%d%H%M%S")"
+ mv "${dbdir}" "${dbdir}-corrupted-$(date -u +"%Y%m%d%H%M%S")"
+ mkdir -p "${dbdir}"
+ log-line msg "copying back data from backup..."
+ docker run --rm -v "${dbdir}":/var/lib/mysql:rw -v "$(pwd)/${base_dir}":/backup:ro \
+  mariadb:11.8 mariadb-backup --copy-back --target-dir=/backup --datadir=/var/lib/mysql 2> /dev/null
+ log-line msg "starting MariaDB container..."
+ docker start database
+ wait_for_db database root ${DB_PASSWORD}
+ if [ "${is_pitr}" = "1" ] && [[ "${backup_end_datetime}" < "${target_datetime_str}" ]]; then
+  log-line msg "applying binary logs from ${backup_end_datetime} → ${target_datetime_str}..."
+  local pitr_dir=$(mktemp -d)
+  mkdir -p "${pitr_dir}"
+  cp "${backupsDir}/${ts}/mariadb/binlogs/"* "${pitr_dir}"
+  if [ "${?}" -ne 0 ]; then
+   log-line msg "failed to copy binary logs to PITR folder"
+  else
+   local binlog_files=($(ls "${pitr_dir}"/os-bin.* 2>/dev/null | grep -v ".idx" | grep -v ".index" | sort))
+   if [ ${#binlog_files[@]} -gt 0 ]; then
+    local binlog_pos_file="${restore_dir}/base/mariadb_backup_binlog_info"
+    local start_file=$(awk '{print $1}' "${binlog_pos_file}")
+    local start_pos=$(awk '{print $2}' "${binlog_pos_file}")
+    local binlog_cmd="mariadb-binlog --no-defaults --set-charset=utf8mb4"
+    local started=0
+    for bp in "${binlog_files[@]}"; do
+     bf=$(basename "${bp}")
+     if [[ "${bf}" < "${start_file}" ]]; then continue; fi
+     if [[ "${bf}" == "${start_file}" ]]; then
+      binlog_cmd="${binlog_cmd} \"/pitr/$(basename ${bf})\" --start-position=\"${start_pos}\""
+      started=1
+     elif [ ${started} = 1 ]; then
+      binlog_cmd="${binlog_cmd} \"/pitr/$(basename ${bf})\""
+     fi
+    done
+    binlog_cmd="${binlog_cmd} --stop-datetime=\"${target_datetime_str}\""
+    log-line msg "executing: ${binlog_cmd} | mariadb"
+    echo '#!/bin/bash' > ./import-script.sh
+    echo "${binlog_cmd} | mariadb -u root -p${DB_PASSWORD}" >> ./import-script.sh
+    echo "rm -rf /pitr" >> ./import-script.sh
+    chmod +x ./import-script.sh
+    docker cp ./import-script.sh database:/import-script.sh
+    docker cp "${pitr_dir}" database:/pitr
+    docker exec database /import-script.sh
+    docker exec database rm -rf /import-script.sh /pitr
+    rm ./import-script.sh
+    log-line msg "binary logs applied successfully"
+   else
+    log-line msg "no individual binlog files found after extraction"
+   fi
+  fi
+  rm -rf "${pitr_dir}"
+ else
+  if [ "${is_pitr}" = "1" ]; then
+   log-line msg "target time (${target_datetime_str}) is not after backup end time (${backup_end_datetime}) → no binlog apply needed"
+  fi
+ fi
+ log-line msg "=== RESTORE COMPLETED successfully ==="
+}
+
+restore-db-from-local() {
+ local target_datetime_str="${1}"
+ local ts="${2}"
+ local is_pitr=0
+ local target_ts="99999999999999"
+ if [ -n "${target_datetime_str}" ]; then
+  if ! date -d "${target_datetime_str}" >/dev/null 2>&1; then
+   log-line err "invalid datetime format for ${target_datetime_str} (use yyyy-MM-dd HH:mm:ss)"
+   return 1
+  fi
+  target_ts=$(date -d "${target_datetime_str}" +"%Y%m%d%H%M%S")
+  is_pitr=1
+  log-line msg "=== POINT-IN-TIME RESTORE to ${target_datetime_str} ==="
+ else
+  log-line msg "=== RESTORE to latest available backup (no PITR) ==="
+ fi
+ local backup_root="${backupsDir}/${ts}/mariadb"
+ local restore_dir="${restoreDir}/mariadb"
+ rm -rf "${restore_dir}"
+ mkdir -p "${restore_dir}"
+ local selected_full_dir="${backup_root}/full"
+ if [ ! -d "${selected_full_dir}" ]; then
+  log-line err "no full backup found in ${selected_full_dir}"
+  return 1
+ fi
+ log-line msg "found full backup: ${selected_full_dir}/"
+ local inc_dirs=($(ls -d "${backup_root}"/inc_* 2>/dev/null | sort))
+ local selected_inc_dirs=()
+ for dir in "${inc_dirs[@]}"; do
+  local incts=${dir##*/inc_}
+  if [[ "${incts}" > "${ts}" ]] && [[ "${incts}" < "${target_ts}" || "${incts}" == "${target_ts}" ]]; then
+   selected_inc_dirs+=("${dir}")
+  fi
+ done
+ log-line msg "selected ${#selected_inc_dirs[@]} incremental backup(s)"
+ local full_stream="${selected_full_dir}/backup.xbstream"
+ extract_xbstream "${full_stream}" "${restore_dir}/base"
+ for ((i=0; i<${#selected_inc_dirs[@]}; i++)); do
+  local inc_stream="${selected_inc_dirs[i]}/backup.xbstream"
+  extract_xbstream "${inc_stream}" "${restore_dir}/_inc_$i"
+ done
+ perform_restore "${is_pitr}" "${target_datetime_str}" "${ts}"
+ if [ "${?}" -ne 0 ]; then
+  log-line err "there's been an error restoring the database"
+  log-line err "fix the errors, then re-run restore with ${0} restore-db-local '${1}' '${2}'"
+ fi
+ rm -rf "${restore_dir}"
+}
+
+###################################################################################################
+############################################# MODELS ##############################################
+###################################################################################################
+
+bkp-models() {
+ local ts="${1}"
+ local mbd="${backupsDir}/${ts}/models"
+ if [ ! -d "${modelsRoot}" ]; then
+  log-line err "models root path doesn't exist, skipping models backup"
+  exit 1
+ fi
+ mkdir -p "${mbd}"
+ find "${modelsRoot}" -type d -name "weights" -print0 | while IFS= read -r -d '' weightsDir; do
+  relPath="${weightsDir#"${modelsRoot}"}"
+  relPath="${relPath#/}"
+  target="${mbd}/${relPath}"
+  mkdir -p "$(dirname "${target}")"
+  cp -a "${weightsDir}" "${target}"
+ done
+}
+
+restore-models-from-local() {
+ ts=$(date -u +"%Y%m%d%H%M%S")
+ bkproot="${backupsDir}/models"
+ targetdir="${datadir}/models"
+ if [ ! -d "${bkproot}" ]; then
+  log-line err "models backup path doesn't exist, skipping restore"
+  exit 1
+ fi
+ # TODO: find latest models backup, copy folder content to $targetdir
+ local model_dirs=($(ls -d "${bkproot}"/models_* 2>/dev/null | sort))
+ local selected_model_dir=""
+ local selected_model_ts=""
+ for ((i=${#model_dirs[@]}-1; i>=0; i--)); do
+  local mts=${model_dirs[i]##*/models_}
+  if [[ "${mts}" < "${ts}" || "${mts}" == "${ts}" ]]; then
+   selected_model_dir="${model_dirs[i]}"
+   selected_model_ts="${mts}"
+   break
+  fi
+ done
+ mkdir -p "${targetdir}"
+ cp -R "${selected_model_dir}/"* "${targetdir}"
+}
+
+
+###################################################################################################
+######################################## CLOUD OPERATIONS #########################################
+###################################################################################################
+
+bkp-to-cloud() {
+ local ts="${1}"
+ local level="${2}"
+ local archiveName="${level}-backup.${srv}.${ts}.tar.bz2"
+ local archivePath="/tmp/${archiveName}"
+ local encryptedPath="${archivePath}.aes256"
+ tar -cvjf "${archivePath}" -C "${backupsDir}/${ts}" . 2>/dev/null 2>&1
+ export PASSPHRASE="${AES_PASSPHRASE}"
+ openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -in "${archivePath}" -out "${encryptedPath}" -pass env:PASSPHRASE
+ local cloudPath="gs://osai-backup/${archiveName}.aes256"
+ if gcloud storage ls "${cloudPath}" >/dev/null 2>&1; then
+  gcloud storage rm "${cloudPath}" 2>/dev/null || true
+ fi
+ gcloud storage cp "${encryptedPath}" "${cloudPath}"
+ if [ "${?}" -eq 0 ]; then
+  if [ "${level}" = "weekly" ]; then
+   gcloud storage rm -q gs://osai-backup/daily-backup.${srv}.*.tar.bz2.aes256 2>/dev/null || true
+  fi
+  rm -f "${archivePath}.aes256"
+ else
+  log-line wrn "failed to upload encrypted archive to cloud, moving to restore directory"
+  mkdir -p "${restoreDir}"
+  mv "${encryptedPath}" "${restoreDir}"
+ fi
+ rm -f "${archivePath}"
+}
+restore-from-cloud() {
+ local targets="${1}"
+ local ts=$(date -u +"%Y%m%d%H%M%S")
+ local tts
+ if [ ! -z "${targets}" ] && tts=$(date -u -d "${targets}" +"%Y%m%d%H%M%S" 2>/dev/null); then
+  ts="${tts}"
+ elif [ ! -z "${targets}" ]; then
+  log-line err "invalid datetime format - use 'yyyy-MM-dd HH:mm:ss'"
+  return 1
+ fi
+ local candidates=$(gcloud storage ls "gs://osai-backup/*-backup.${srv}.*.tar.bz2.aes256" 2>/dev/null | grep -E ".*-backup\.${srv}\.[0-9]{14}\.tar\.bz2\.aes256$")
+ if [[ -z "${candidates}" ]]; then
+  log-line err "no backups found before '${targets}'"
+  return 1
+ fi
+ local latest_file=""
+ local latest_ts="00000000000000"
+ while IFS= read -r line; do
+  local filename=$(basename "${line}")
+  local file_ts=$(echo "${filename}" | grep -oE '[0-9]{14}' || echo "00000000000000")
+  if [[ "${file_ts}" > "${latest_ts}" ]] && [[ ! "${file_ts}" > "${ts}" ]]; then
+   latest_ts="${file_ts}"
+   latest_file="${line}"
+  fi
+ done <<< "${candidates}"
+ if [[ -z "${candidates}" ]]; then
+  log-line err "no backups found before '${targets}'"
+  return 1
+ fi
+ local archive_name=$(basename "${latest_file}")
+ local local_encrypted_path="${restoreDir}/${archive_name}"
+ mkdir -p "${restoreDir}"
+ if ! gcloud storage cp "${latest_file}" "${local_encrypted_path}"; then
+  log-line err "failed to download backup from cloud"
+  return 1
+ fi
+ export PASSPHRASE="${AES_PASSPHRASE}"
+ if ! openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in "${local_encrypted_path}" -out "${restoreDir}/downloaded-backup.tar.bz2" -pass env:PASSPHRASE; then
+  log-line err "decyption failed (incorrect passphrase?)"
+  rm -f "${local_encrypted_path}"
+  return 1
+ fi
+ if ! tar xvfj "${restoreDir}/downloaded-backup.tar.bz2" -C "${restoreDir}"; then
+  log-line err "failed to extract archive"
+  rm -f "${restoreDir}/downloaded-backup.tar.bz2" "${local_encrypted_path}"
+  return 1
+ fi
+ rm -f "${restoreDir}/downloaded-backup.tar.bz2" "${local_encrypted_path}"
+ sync
+ replaceLocal=false
+ if [ ${#} -ge 2 ] && [ "${2}" = "--replace-local-backup" ]; then
+  replaceLocal=true
+ elif [ ${#} -ge 2 ]; then
+  log-line msg "skip replacing local backup due to second argument value: ${2}"
+ else
+  if [ -d "${backupsDir}/${latest_ts}" ]; then
+   echo "Replace existing local backup with the restored version?"
+   echo "WARNING: This will remove the local backups folder, so it might be a good idea to back it up."
+   read -r -p "Type 'replace' to confirm: " answer
+   echo
+   case "${answer}" in
+    replace) replaceLocal=true;;
+    *) replaceLocal=false;;
+   esac
+  fi
+ fi
+ if [ "${replaceLocal}" = true ] && [ -d "${backupsDir}/${latest_ts}" ]; then
+  rm -rf "${backupsDir}/${latest_ts}"
+  if [ "${?}" -ne 0 ]; then
+   log-line err "failed to remove old backups directory - possible permissions issue"
+   log-line err "resolve issue with ${backupsDir} manually, then mv \"${restoreDir}\" \"${backupsDir}/${latest_ts}\""
+   return 1
+  fi
+  mv "${restoreDir}" "${backupsDir}/${latest_ts}"
+  if [ "${?}" -ne 0 ]; then
+   log-line err "failed to move restored directory"
+   log-line err "resolve issue with ${backupsDir} manually, then mv \"${restoreDir}\" \"${backupsDir}/${latest_ts}\""
+   return 1
+  fi
+ elif [ ! -d "${backupsDir}/${latest_ts}" ]; then
+  replaceLocal=true
+  mv "${restoreDir}" "${backupsDir}/${latest_ts}"
+  if [ "${?}" -ne 0 ]; then
+   log-line err "failed to move restored directory"
+   log-line err "resolve issue with ${backupsDir} manually, then mv \"${restoreDir}\" \"${backupsDir}/${latest_ts}\""
+   return 1
+  fi
+ else
+  log-line msg "to use the freshly restored files as the new local backup at a later time, run 'mv \"${restoreDir}\" \"${backupsDir}/${latest_ts}\"'"
+ fi
+ if [ "${replaceLocal}" = true ]; then
+  restore-db-from-local "${targets}" "${latest_ts}"
+ fi
+}

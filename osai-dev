@@ -1,0 +1,512 @@
+#!/bin/bash
+
+if [ -z "${scriptdir}" ]; then
+ echo "scriptdir not set: bug in osai or osai-dev?"
+ exit 1
+fi
+
+. "${scriptdir}/osai-common"
+
+if [ -z "${env}" ] && [ -f "${scriptdir}/.env" ]; then
+ set -a
+ . "${scriptdir}/.env"
+ set +a
+fi
+
+composeLive=(-f "${scriptdir}/docker.live.yaml")
+composeTrain=()
+[ -f "${scriptdir}/docker.train.base.yaml" ] && composeTrain+=(-f "${scriptdir}/docker.train.base.yaml")
+[ -f "${scriptdir}/docker.train.apps.yaml" ] && composeTrain+=(-f "${scriptdir}/docker.train.apps.yaml")
+if [ "${env}" = "dev" ] || [ "${env}" = "test" ]; then
+ composeLive+=("-f" "${scriptdir}/docker.live.override.yaml")
+ [ -f "${scriptdir}/docker.train.override.yaml" ] && composeTrain+=("-f" "${scriptdir}/docker.train.override.yaml")
+fi
+
+show-dev-help() {
+  cat <<EOF
+ ${cyan}================${r}
+ ${cyan}= Dev commands =${r}
+ ${cyan}================${r}
+
+  ${red}VPN connections${r}
+   ${b}c${r}
+    - connects to the VPN
+
+   ${b}dc${r}
+    - disconnects from the VPN
+
+   ${b}live${r} [params...]
+    - connect to live and ssh into server, or with params deploy to live
+    - before connecting, connects to the VPN
+    - see ${b}${0} live --help${r} for more info
+
+   ${b}train${r} [params...]
+    - connect to train and ssh into server, or with params deploy to live
+    - before connecting, connects to the VPN
+    - see ${b}${0} train --help${r} for more info
+
+  ${red}Database version adjustment (dev only)${r}
+   ${b}db-decver${r} [database-name]
+    - decrements the version number in the ${b}setting${r} table by 1, without running any SQL
+    - use after a failed upgrade where the UP script errored immediately (made no schema changes)
+      so that ${b}db-upgrade${r} can be retried after fixing the migration script
+    - default database name is ${b}optisolar${r}
+
+   ${b}db-incver${r} [database-name]
+    - increments the version number in the ${b}setting${r} table by 1, without running any SQL
+    - use after a failed downgrade where the DOWN script errored immediately (made no schema changes)
+    - default database name is ${b}optisolar${r}
+
+  ${red}Database (re)population${r}
+   ${b}itd${r} <table-name>
+    - imports table from ${b}table-name${r} from live to local database for testing
+
+  ${red}Platform manipulation${r}
+   ${b}rb${r} <service-name> [--force]
+    - rebuilds the image for ${b}service-name${r} from its local build context and restarts the container
+    - ${b}--force${r} flag forces a rebuild even if no changes are detected by docker
+
+   ${b}recreate-all${r}
+    - brings the whole platform down, rebuilds all images from source, and brings the platform back up, upgrading the database to the latest version
+
+  ${red}Docker image manipulation${r}
+   ${b}rbi${r} [-p] [services...]
+    - rebuilds images of services specified by ${b}services...${r}
+    - if no services are specified, rebuilds all custom images
+    - if ${b}-p${r} is specified, built images will be pushed to ${repoURL}
+
+   ${b}rbi-all${r} [-p]
+    - rebuilds all custom service images without starting containers
+    - if ${b}-p${r} is specified, built images will be pushed to ${repoURL}
+
+EOF
+}
+
+show-env-help() {
+ echo "naredbe i opcije za okruženja:"
+ echo
+ echo " db       - izvršava SQL naredbu na bazi danog okruženja i ispisuje rezultat"
+ echo " db-login - ulogira se na bazu na danom okruženju"
+ echo " deploy   - pokušava deploy lokalnog okruženja na dano okurženje"
+ echo "            potrebno je nalaziti se na potpuno sinkroniziranom git branch-u predviđenom za okruženje na koje se radi deploy"
+ echo " ps       - izvršava docker ps na svim serverima u danom okruženju"
+ echo "            svi dalnji parametri interpretiraju se kao argumenti za docker ps"
+}
+
+. "${scriptdir}/.env.dev"
+
+verify-branch() {
+ branch="$(get-param 1 grana -v "${1}")"
+ environment="$(get-param 1 okruženje -v "${2}")"
+ if [[ "${branch}" != "${environment}" ]]; then
+  echo "greška: na ${environment} okruženje moguć je deployment samo s grane '${environment}'"
+  exit 1
+ fi
+ if [ -n "$(git status --porcelain)" ]; then
+  echo "greška: imate lokalne promjene koje nisu committane; nije dozvoljen deploy prije commita"
+  exit 1
+ fi
+ git pull origin "${branch}"
+ if [ ${?} -ne 0 ]; then
+  echo "greška: nije uspio pull s gitlaba"
+  exit 1
+ fi
+ if [ -n "$(git diff origin/${branch}..${branch})" ]; then
+  echo "greška: lokalna grana nije sinkronizirana s gitlabom; najprije pushajte promjene"
+  exit 1
+ fi
+}
+
+env-db() {
+ local server="$(get-param 1 server -v "${1}")"
+ local sql="${2}"
+ local db="${3:-optisolar}"
+ if [ -z "${sql}" ]; then
+  echo "usage: osai live db <sql-statement> [database-name]"
+  exit 1
+ fi
+ ssh "${server}" "cd /base/optisolar && ./osai db $(printf '%q' "${sql}") ${db}"
+}
+env-db-login() {
+ server="$(get-param 1 server -v "${1}")"
+ db="$(get-param 1 "baza podataka" -v "${2}" -d optisolar)"
+ ssh -t "${server}" "cd /base/optisolar && ./osai db-login ${db}"
+}
+env-db-upgrade() {
+ server="$(get-param 1 server -v "${1}")"
+ db="$(get-param 1 "baza podataka" -v "${2}" -d optisolar)"
+ ssh "${server}" "cd /base/optisolar && ./osai db-upgrade ${db}"
+}
+env-db-downgrade() {
+ server="$(get-param 1 server -v "${1}")"
+ db="$(get-param 1 "baza podataka" -v "${2}" -d optisolar)"
+ ssh "${server}" "cd /base/optisolar && ./osai db-downgrade ${db}"
+}
+env-deploy() {
+ environment="$(get-param 1 "okruženje" -v "${1}")"
+ if [ ${?} -ne 0 ] || [ -z "${environment}" ]; then
+  echo "${0}: greška kod dohvata okruženja; provjerite skriptu!"
+  exit 1
+ fi
+ shift
+ while getopts "l:t:v:f" opt; do
+  case $opt in
+   l) liveserver="${OPTARG}";;
+   t) trainserver="${OPTARG}";;
+   v) service="${OPTARG}";;
+   f) force="${OPTARG}";;
+   \?) echo "greška: nepoznata opcija -${OPTARG}"; exit 1 ;;
+  esac
+ done
+ if [ -z "${liveserver}" ] && [ -z "${trainserver}" ]; then
+  echo "otkazujem deploy: nije definiran ni live ni trening server"
+  exit
+ fi
+ cd "${scriptdir}"
+ branch=$(git rev-parse --abbrev-ref HEAD)
+ if [[ "${branch}" != "feature-gitlab" ]]; then
+  verify-branch "${branch}" "${environment}"
+ fi
+ read -p "Čini se da je sve OK s repozitorijem. Želite li nastaviti deploy na ${environment}? (y/n) " confirm
+ [ "${confirm}" != "y" ] && exit 2 || c
+ # Deploy is a plain rsync of the few things a server actually needs to run
+ # `osai` and docker compose against pre-built images already pulled from
+ # the registry -- not a mirror of the whole repo. `osai-dev` is deliberately
+ # excluded: it's a dev-only tool and must never land on test/stage/prod.
+ # `--include='*/'` lets rsync walk every directory (so nested includes below
+ # are reachable), `-m` then prunes any directory that ends up empty (e.g.
+ # source dirs that are only build contexts, like osapi/ or web-api/, never
+ # match a rule).
+ # Excludes must precede --include='*/' -- otherwise that catch-all directory
+ # include would already have matched (e.g. models/inference/) before a later,
+ # more specific exclude ever gets a chance to.
+ local syncCommon=(
+  --exclude='.git' --exclude='.venv/' --exclude='venv/' --exclude='__pycache__/'
+  --exclude='/data/'
+  --exclude='/models/training/data/datasets/'
+  --exclude='/models/training/data/models/'
+  --exclude='/models/training/data/scripts/pytorch_env/'
+  --exclude='/models/training/data/scripts/old_datasets_and_models/'
+  --include='*/'
+  --include='/osai' --include='/osai-common' --include='/osai-backup-restore'
+  --include='/.env.template'
+  --include='/docker.*'
+  --include='/database/**'
+  # chatbot/dify.env.template(.dev) are synced so the deployed `osai`
+  # regenerates chatbot/dify.env on the server (see osai's envsubst calls).
+  # Shipped to train too, ahead of the chatbot stack likely landing there.
+  --include='/chatbot/dify.env.template' --include='/chatbot/dify.env.dev.template'
+  --include='/chatbot/docker-compose.override.yaml' --include='/chatbot/docker-compose.gpu.yaml'
+  # chatbot/dify/docker/** is no longer a submodule (plain files tracked in
+  # this repo, see chatbot/docker-compose.override.yaml's header comment) --
+  # every chatbotServices entry (osai-common) pulls a prebuilt image, so
+  # only the compose file plus the two config files it bind-mounts into
+  # ssrf_proxy and sandbox exist at all, not a full dify source tree to trim.
+  --include='/chatbot/dify/docker/docker-compose.yaml'
+  --include='/chatbot/dify/docker/ssrf_proxy/**'
+  --include='/chatbot/dify/docker/volumes/sandbox/conf/**'
+  # chatbot-bootstrap() (osai-common) runs these against the live chatbot-api
+  # to automate the Dify console setup -- must ship for chatbot-update to work.
+  --include='/chatbot/bootstrap.py' --include='/chatbot/config.yml' --include='/chatbot/knowledge-base/**'
+  # Only the model scripts (run.py etc.) are deployed here -- osapi mounts
+  # /models/inference read-only and needs these to be present on the live/test
+  # server. Weights and scalers are excluded: they're not tracked in git and
+  # are expected to already be copied/mounted onto the server separately.
+  --include='/models/inference/**/*.py'
+ )
+ if [ ! -z "${liveserver}" ]; then
+  echo "======== RSYNC NA LIVE ========"
+  rsync -avz -m --no-perms "${syncCommon[@]}" --include='/conf/**' --exclude='*' -e ssh "${scriptdir}/" "deployer@${liveserver}:/base/optisolar"
+  if [ $? -ne 0 ]; then
+   echo "greška: nije uspio ${environment} deploy na optisolar server"
+   exit 1
+  fi
+  if [ "${environment}" = "stage" ] || [ "${environment}" = "prod" ]; then
+   ssh deployer@"${liveserver}" "/base/optisolar/osai setup-live-backup"
+  fi
+ fi
+ if [ ! -z "${trainserver}" ]; then
+  echo "======== RSYNC NA TRAIN ========"
+  rsync -avz -m --no-perms "${syncCommon[@]}" \
+   --include='/models/training/data/scripts/*.py' \
+   --include='/models/training/jupyter/**' \
+   --include='/models/training/vscode/**' \
+   --exclude='*' -e ssh "${scriptdir}/" "deployer@${trainserver}:/base/optisolar-training"
+  if [ $? -ne 0 ]; then
+   echo "greška: nije uspio ${environment} deploy na optisolar-train server"
+   exit 1
+  fi
+ fi
+ doforce=
+ if [ "${force}" == "1" ]; then
+  doforce=" --force"
+ fi
+ if is-element "${service}" "${liveservices[@]}"; then
+  if [ ! -z "${liveserver}" ]; then
+   ssh "${liveserver}" "/base/optisolar/osai update ${service}"
+  fi
+ elif is-element "${service}" "${trainservices[@]}"; then
+  if [ ! -z "${trainserver}" ]; then
+   ssh "${trainserver}" "/base/optisolar-training/osai update ${service}"
+  fi
+ elif [ "${service}" == "all" ]; then
+  if [ ! -z "${liveserver}" ]; then
+   ssh "${liveserver}" "/base/optisolar/osai update"
+  fi
+  if [ ! -z "${trainserver}" ]; then
+   ssh "${trainserver}" "/base/optisolar-training/osai update"
+  fi
+ elif [ "${service}" == "none" ] || [ -z "${service}" ]; then
+  echo "promjene su sinkronizirane"
+ else
+  echo "greška: nepoznati servis ${service}"
+  exit 1
+ fi
+}
+env-ps() {
+ liveenv="$(get-param 0 "live okruženje" -v "${1}")"
+ trainenv="$(get-param 0 "trening okruženje" -v "${2}")"
+ if [ -z "${liveenv}" ] && [ -z "${trainenv}" ]; then
+  echo "nema containera: nije definirano ni live ni trening okruženje"
+  exit
+ fi
+ shift; shift
+ if [ ! -z "${liveenv}" ]; then
+  echo "======== CONTAINERI NA LIVE ========"
+  docker --context "${liveenv}" ps --format 'table {{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}' ${@}
+ fi
+ if [ ! -z "${trainenv}" ]; then
+  if [ ! -z "${liveenv}" ]; then
+   echo
+  fi
+  echo "======== CONTAINERI NA TRAIN ========"
+  docker --context "${trainenv}" ps --format 'table {{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}' ${@}
+ fi
+}
+
+stage() {
+ local cmd=${1}
+ shift
+ case ${cmd} in
+  --help)       show-env-help;;
+  db)           env-db optisolar "${@}";;
+  db-login)     env-db-login optisolar ${@};;
+  db-upgrade)   env-db-upgrade optisolar ${@};;
+  db-downgrade) env-db-downgrade optisolar ${@};;
+  deploy)       p1="${1}"
+                p2="${2}"
+                if [ -z "${p1}" ]; then
+                 env-deploy stage -l optisolar -t optisolar-train
+                elif [[ "${p1}" == "-f" ]]; then
+                 env-deploy stage -l optisolar -t optisolar-train -f 1
+                elif [ ! -z "${p1}" ]; then
+                 if [ ! -z "${p2}" ] && [[ "${p2}" == "-f" ]]; then
+                  env-deploy stage -l optisolar -t optisolar-train -v ${p1} -f 1
+                 elif [ ! -z "${p2}" ]; then
+                  echo "nepoznata opcija/parametar ${p2}"
+                  exit 1
+                 else
+                  env-deploy stage -l optisolar -t optisolar-train -v ${p1}
+                 fi
+                fi;;
+  ps)           env-ps stagepub stagetrain ${@};;
+  *)
+   echo "greška: nepoznata naredba '${cmd}'; koristite --help za pomoć"
+   exit 1
+ esac
+}
+test-env() {
+ local cmd="${1}"
+ shift
+ case "${cmd}" in
+  --help) show-env-help;;
+  deploy) p1="${1}"
+          p2="${2}"
+          if [ -z "${p1}" ]; then
+           env-deploy test -l optisolar-test-deploy
+          elif [[ "${p1}" == "-f" ]]; then
+           env-deploy test -l optisolar-test-deploy -f 1
+          elif [ ! -z "${p1}" ]; then
+           if [ ! -z "${p2}" ] && [[ "${p2}" == "-f" ]]; then
+            env-deploy test -l optisolar-test-deploy -v ${p1} -f 1
+           elif [ ! -z "${p2}" ]; then
+            echo "nepoznata opcija/parametar ${p2}"
+            exit 1
+           else
+            env-deploy test -l optisolar-test-deploy -v ${p1}
+           fi
+          fi;;
+  *)      echo "greška: nepoznata naredba '${cmd}'; koristite --help za pomoć"
+          exit 1
+ esac
+}
+
+c() {
+ if ! ip link show wg0 >/dev/null 2>&1; then
+  sudo wg-quick up wg0
+ fi
+}
+dc() {
+ sudo wg-quick down wg0
+}
+live() {
+ if [ -z "${1}" ]; then
+  c
+  ssh optisolar
+ else
+  stage "${@}"
+ fi
+}
+train() {
+ if [ -z "${1}" ]; then
+  c
+  ssh optisolar-train
+ else
+  live ${@}
+ fi
+}
+tst() {
+ if [ -z "${1}" ]; then
+  ssh optisolar-test
+ else
+  test-env "${@}"
+ fi
+}
+
+db-decver() {
+ db=$(get-param 1 "naziv baze podataka" -v "${1}" -d optisolar)
+ docker run --rm -v "${scriptdir}/database:/db:ro" --network os mariadb:11.8.1-ubi9-rc /db/updater/dbdecver -h database -uroot -p${DB_PASSWORD} ${db}
+}
+db-incver() {
+ db=$(get-param 1 "naziv baze podataka" -v "${1}" -d optisolar)
+ docker run --rm -v "${scriptdir}/database:/db:ro" --network os mariadb:11.8.1-ubi9-rc /db/updater/dbincver -h database -uroot -p${DB_PASSWORD} ${db}
+}
+
+import-table-data() {
+ if [ -z "${1}" ]; then
+  echo "need table name"
+  exit 1
+ fi
+ dbName="${LIVE_DB_NAME}"
+ if [ ! -z "${2}" ]; then
+  dbName="${2}"
+ fi
+ dbNameDest="${DB_NAME}"
+ if [ ! -z "${3}" ]; then
+  dbNameDest="${3}"
+ else
+  if [ ! -z "${2}" ]; then
+   dbNameDest="${dbName}"
+  fi
+ fi
+ ip=$(ssh -G optisolar | grep -i "^hostname" | awk '{print $2}')
+ echo '#!/bin/bash' > ./import-script.sh
+ echo 'mariadb-dump -h '${ip}' -u '${LIVE_DB_USER}' -p'${LIVE_DB_PASS}' '${dbName}' '${1}' --no-create-info --complete-insert --insert-ignore --ssl-verify-server-cert=OFF | mariadb -u root -p'${DB_PASSWORD}' '${dbNameDest} >> ./import-script.sh
+ chmod +x ./import-script.sh
+ docker cp ./import-script.sh database:/import-script.sh
+ docker exec database /import-script.sh
+ docker exec database rm /import-script.sh
+ rm ./import-script.sh
+}
+
+rb() {
+ local service="${1}"
+ local f=("" "")
+ if [ -z "${service}" ]; then
+  echo "usage: osai-dev rb <SERVICE> [--force]"
+  exit 1
+ fi
+ if [ "${2}" == "--force" ]; then
+  f=(" --no-cache" " --force-recreate")
+ fi
+ if [ "${srv}" == "live" ] || [ "${srv}" == "both" ]; then
+  if is-element "${service}" "${liveservices[@]}"; then
+   docker compose "${composeLive[@]}" build "${service}"${f[0]}
+   docker compose "${composeLive[@]}" up -d "${service}"${f[1]}
+  fi
+ fi
+ if ([ "${srv}" == "train" ] || [ "${srv}" == "both" ]) && [ ${#composeTrain[@]} -gt 0 ]; then
+  if is-element "${service}" "${trainservices[@]}"; then
+   docker compose "${composeTrain[@]}" build "${service}"${f[0]}
+   docker compose "${composeTrain[@]}" up -d "${service}"${f[1]}
+  fi
+ fi
+}
+
+recreate-all() {
+ if [ "${srv}" == "live" ] || [ "${srv}" == "both" ]; then
+  docker compose "${composeLive[@]}" down --rmi local
+ fi
+ if ([ "${srv}" == "train" ] || [ "${srv}" == "both" ]) && [ ${#composeTrain[@]} -gt 0 ]; then
+  docker compose "${composeTrain[@]}" down --rmi local
+ fi
+ if [ ! -d "${scriptdir}/data/optisolarai-db" ]; then
+  mkdir -p "${scriptdir}/data/optisolarai-db"
+  chmod -R 777 "${scriptdir}/data"
+ fi
+ if [ "${srv}" == "live" ] || [ "${srv}" == "both" ]; then
+  docker compose "${composeLive[@]}" up -d --build
+ fi
+ if ([ "${srv}" == "train" ] || [ "${srv}" == "both" ]) && [ ${#composeTrain[@]} -gt 0 ]; then
+  docker compose "${composeTrain[@]}" up -d --build
+ fi
+ "${scriptdir}/osai" db-upgrade OptiSolarAI --full
+ "${scriptdir}/osai" db-upgrade optisolar --full
+ "${scriptdir}/osai" db-upgrade analytics --full
+}
+
+rbi-all() {
+ local push
+ if [ "${1}" == "-p" ]; then push=1; fi
+ local compose_files=(-f "${scriptdir}/docker.live.yaml" -f "${scriptdir}/docker.train.apps.yaml" -f "${scriptdir}/orchestration/docker.ephemeral.yaml")
+ docker compose "${compose_files[@]}" build
+ if [ -n "${push}" ]; then
+  docker login "${repoURL}" -u "${repoUser}" -p"${repoPass}" > /dev/null 2>&1
+  local imgs
+  imgs=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^registry\.clab\.hr/')
+  for img in ${imgs}; do docker push "${img}"; done
+ fi
+}
+
+rbi() {
+ local push
+ if [ "${1}" == "-p" ]; then push=1; shift; fi
+ local compose_files=(-f "${scriptdir}/docker.live.yaml" -f "${scriptdir}/docker.train.apps.yaml" -f "${scriptdir}/orchestration/docker.ephemeral.yaml")
+ if [ ${#@} -gt 0 ]; then
+  docker compose "${compose_files[@]}" build "${@}"
+  if [ -n "${push}" ]; then
+   docker login "${repoURL}" -u "${repoUser}" -p"${repoPass}" > /dev/null 2>&1
+   docker compose "${compose_files[@]}" push "${@}"
+  fi
+ else
+  docker compose "${compose_files[@]}" build
+  if [ -n "${push}" ]; then
+   docker login "${repoURL}" -u "${repoUser}" -p"${repoPass}" > /dev/null 2>&1
+   local imgs
+   imgs=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^registry\.clab\.hr/')
+   for img in ${imgs}; do docker push "${img}"; done
+  fi
+ fi
+}
+
+cmd=${1}
+shift
+
+case ${cmd} in
+ test)                 tst "${@}";;
+ live)                 live "${@}";;
+ c)                    c;;
+ dc)                   dc;;
+ train)                train "${@}";;
+ db-decver)            db-decver "${@}";;
+ db-incver)            db-incver "${@}";;
+ itd)                  import-table-data ${@};;
+ rb)                   rb "${@}";;
+ recreate-all)         recreate-all;;
+ rbi)                  rbi "${@}";;
+ rbi-all)              rbi-all "${@}";;
+ help|""|-h|--help)    show-dev-help;;
+ *)
+  echo "${0}: unknown command '${b}${cmd}${r}'" >&2
+  exit 255;;
+esac

@@ -1,0 +1,396 @@
+#!/bin/bash
+
+if [[ -t 1 ]]; then
+ b=$(tput bold 2>/dev/null || echo '')
+ red=$(tput setaf 1)
+ yellow=$(tput setaf 3)
+ cyan=$(tput setaf 6)
+ r=$(tput sgr0)
+else
+ b=
+ red=
+ yellow=
+ cyan=
+ r=
+fi
+
+show-help() {
+  cat <<EOF
+usage: ${b}${0} <command> [params...]${r}
+
+ ${cyan}=================${r}
+ ${cyan}= Prod commands =${r}
+ ${cyan}=================${r}
+
+  ${red}Platform backup and restore${r}
+   ${b}bkp-db-daily${r} [timestamp]
+    - performs a daily (incremental) backup of all databases, appending to the latest full backup, or one specified by ${b}[timestamp]${r}
+    - if a weekly backup is running, this script will do nothing
+    - if an hourly backup is running it will be terminated before daily backup starts
+    - if there are no previous full backups, this script will run ${b}bkp-db-weekly${r} and then exit
+    - the backup stream is stored locally in the ${b}${backupsDir}/mariadb/inc_yyyyMMdd-HHmmss${r} directory
+
+   ${b}bkp-db-hourly${r} [timestamp]
+    - performs an hourly (binlog) backup of all databases, starting from the binlog active during last full backup, or full backup specified by ${b}[timestamp]${r}
+    - if any higher priority backup process (weekly or hourly) is running, this script will do nothing
+    - if there are no previous full backups, this script will do nothing
+    - the backup stream is stored locally in the ${b}${backupsDir}/mariadb/binlogs${r} directory
+
+   ${b}bkp-db-weekly${r}
+    - performs a weekly (full) backup of all databases
+    - any existing lower-priority backup processes (daily or hourly) will be terminated
+    - the backup archive is stored locally in the ${b}${backupsDir}/mariadb/full_yyyyMMdd-HHmmss${r} directory
+
+   ${b}bkp-models${r}
+    - backs up inference models stored in ${b}${datadir}/models${r}
+    - the backup is stored locally in the ${b}${backupsDir}/models${r} directory
+
+   ${b}bkp-to-cloud${r}
+    - archives everything to a ${b}bzip${r} archive, encrypts the archive with ${b}aes-256-cbc${r} cypher using the value of the environment variable ${b}\${AES_PASSPHRASE}${r} as the encryption key and uploads to cloud
+    - assumes ${b}gcloud${r} exists on the system and uploads the encrypted archive to ${b}gs://osai-backup/${r}
+    - if upload to cloud fails, moves the encrypted archive to ${b}${restoreDir}${r}
+
+   ${b}restore-db-local${r}
+    - restores the database from a local backup in ${b}${backupsDir}/mariadb${r}
+
+   ${b}restore-models-local${r}
+    - restores the models from a local backup in ${b}${backupsDir}/models${r}
+
+   ${b}restore-from-cloud${r} <timestamp:yyyy-MM-dd HH:mm:ss>
+    - restores the encrypted archive with the given timestamp from ${b}gs://osai-backup/${r}, decrypts it using the value of the environment variable ${b}\${AES_PASSPHRASE}${r}, extracts the decrypted archive, and moves the files into ${b}${backupsDir}${r}
+
+   ${b}setup-live-backup${r}
+    - sets up the database and models backup in ${b}cron${r}
+    - weekly backups are on Sunday at midnight
+    - daily backups are every day at 2h
+    - hourly backups are on every 30th minute of every hour
+    - backup to cloud is immediately after each weekly and daily backups
+
+  ${red}Database-related commands${r}
+   ${b}db-downgrade${r} [database-name]
+    - downgrades the database from current version to previous
+    - current version is stored in the database's ${b}setting${r} table
+    - the file ${b}DOWN_xxx_*.sql${r} must exist with valid SQL for this to work, where '${b}xxx${r}' is the database version to downgrade from, in ${b}${scriptdir}/database/<database-name>${r} directory
+    - default database name (when none is specified) is ${b}optisolar${r}
+ 
+   ${b}db-dump${r} [database-name]
+    - dumps everything in ${b}[database-name]${r} database to a file named ${b}<database-name>.dump.<yyyyMMdd>.sql${r}
+    - if parameter is not specified, dumps the ${b}optisolar${r} database
+ 
+   ${b}db-login${r} [database-name]
+    - logs in to database ${b}database-name${r}
+    - if parameter is not specified, logs in to ${b}optisolar${r} database
+ 
+   ${b}db${r} <sql-statement> [database-name]
+    - executes ${b}sql-statement${r} against the database and prints the result
+    - default database name (when none is specified) is ${b}optisolar${r}
+
+   ${b}db-upgrade${r} [database-name[ --full]]
+    - upgrades the database to the next version
+    - current version is stored in the database's ${b}setting${r} table
+    - for this to work, there must be defined a ${b}UP_xxx_*.sql${r} script, where '${b}xxx${r}' is the current database version to upgrade from, in ${b}${scriptdir}/database/<database-name>${r} directory
+    - if ${b}--full${r} flag is specified, the script will upgrade from any version to the newest available version
+    - default database name (when none is specified) is ${b}optisolar${r}
+ 
+  ${red}Platform manipulation${r}
+   ${b}init${r}
+    - initializes configurations for all containers
+
+   ${b}down${r}
+    - stops and removes all containers
+
+   ${b}update${r} [service-name]
+    - pulls the latest image for ${b}service-name${r} from ${repoURL} and restarts the container with the latest configuration
+    - if no service name is given, updates all services
+
+   ${b}rm-all${r}
+    - stops and removes all containers and removes their images
+
+  ${red}Chatbot (Dify)${r}
+   ${b}chatbot-down${r}
+    - stops and removes the chatbot stack's containers (runs as its own compose project, ${b}chatbot${r})
+
+   ${b}chatbot-update${r} [service-name]
+    - pulls the latest image for ${b}service-name${r} and restarts it with the latest configuration
+    - if no service name is given, updates all chatbot services (also first-time bring-up: safe to run on an empty stack)
+    - unlike ${b}update${r}, this never logs in to ${repoURL} -- chatbot images are pulled straight from their public upstream registries
+    - after starting containers, waits for chatbot-api to become healthy, pulls the required Ollama models, then runs ${b}chatbot/bootstrap.py${r} to create the admin account, register model credentials, build/reconcile the knowledge-base dataset, and import+publish the app -- no manual Dify console steps needed
+    - idempotent: safe to re-run any time (e.g. after editing ${b}chatbot/config.yml${r} or the knowledge base)
+
+  ${red}Other commands${r}
+   ${b}help${r} | ${b}""${r} | ${b}-h${r} | ${b}--help${r}
+    - displays this help message
+EOF
+}
+
+get-script-dir() {
+ local srcpath="${BASH_SOURCE[0]}"
+ local sympath
+ local scrpath
+ while [ -L "$srcpath" ]; do
+  sympath="$( cd -P "$( dirname "$srcpath" )" >/dev/null 2>&1 && pwd )"
+  srcpath="$(readlink "$srcpath")"
+  if [[ $srcpath != /* ]]; then
+   srcpath=$sympath/$srcpath
+  fi
+ done
+ scrpath="$(cd -P "$( dirname "$srcpath" )" >/dev/null 2>&1 && pwd)"
+ echo "$scrpath"
+}
+
+export scriptdir=$(get-script-dir)
+
+datadir="${scriptdir}/data"
+dbdir="${datadir}/optisolarai-db"
+mkdir -p "${dbdir}"
+mkdir -p "${datadir}/redis"
+mkdir -p "${datadir}/rabbitmq"
+mkdir -p "${datadir}/certbot"
+
+jupyterDataDir="${scriptdir}/models/training/data"
+if [ ! -d "${jupyterDataDir}" ]; then
+ mkdir -p "${jupyterDataDir}"
+ chown "$(stat -c '%u:%g' "${0}")" "${jupyterDataDir}"
+fi
+
+set -a
+. "${scriptdir}/.env"
+set +a
+. "${scriptdir}/osai-common"
+. "${scriptdir}/osai-backup-restore"
+
+envsubst < "${scriptdir}/.env.template" > "${scriptdir}/.env"
+[ -f "${scriptdir}/chatbot/dify.env.template" ] && envsubst < "${scriptdir}/chatbot/dify.env.template" > "${scriptdir}/chatbot/dify.env"
+[ -f "${scriptdir}/conf/rabbitmq/rabbitmq.conf.template" ] && envsubst < "${scriptdir}/conf/rabbitmq/rabbitmq.conf.template" > "${scriptdir}/conf/rabbitmq/rabbitmq.conf"
+if [ -f "${scriptdir}/conf/certbot/cloudflare.ini.template" ]; then
+ envsubst '${CLOUDFLARE_API_TOKEN}' < "${scriptdir}/conf/certbot/cloudflare.ini.template" > "${scriptdir}/conf/certbot/cloudflare.ini"
+ # certbot refuses to run with a credentials file group/world can read
+ chmod 600 "${scriptdir}/conf/certbot/cloudflare.ini"
+fi
+
+# nginx vhost domains and certs differ per environment (e.g. api.optisolar.ai
+# on live vs test.optisolar.ai on test) -- and per vhost, since Cloudflare
+# (fronting test/live) doesn't allow wildcard certs, so each domain needs its
+# own cert/key file. Each vhost's DOMAIN/CERT_FILE/CERT_KEY trio is
+# independently optional -- an environment that doesn't run a given
+# component (e.g. no chatbot on test) just leaves that trio unset, and only
+# that vhost is skipped (any stale previously-generated conf for it is
+# removed so nginx doesn't pick up an outdated/disabled vhost). envsubst is
+# restricted to just these vars so it doesn't clobber nginx's own
+# $host/$remote_addr/etc.
+render-nginx-site() {
+ local name="${1}" domainVar="${2}" certFileVar="${3}" certKeyVar="${4}"
+ local tmpl="${scriptdir}/conf/nginx/sites-templates/${name}.conf.template"
+ local out="${scriptdir}/conf/nginx/sites-available/${name}.conf"
+ [ -f "${tmpl}" ] || return 0
+ if [ -n "${!domainVar}" ] && [ -n "${!certFileVar}" ] && [ -n "${!certKeyVar}" ]; then
+  envsubst "\${${domainVar}} \${${certFileVar}} \${${certKeyVar}}" < "${tmpl}" > "${out}"
+ else
+  rm -f "${out}"
+ fi
+}
+render-nginx-site api API_DOMAIN API_CERT_FILE API_CERT_KEY
+render-nginx-site chat CHAT_DOMAIN CHAT_CERT_FILE CHAT_CERT_KEY
+render-nginx-site expert EXPERT_DOMAIN EXPERT_CERT_FILE EXPERT_CERT_KEY
+
+# mqtt/amqp are raw TCP (nginx stream module), proxied straight to the
+# rabbitmq container's plaintext listeners (1883/5672) -- TLS terminates
+# once, at nginx, same as the http vhosts above. There's no Host header/SNI
+# routing to do (each protocol gets its own dedicated port), so unlike the
+# http vhosts there's no DOMAIN var to check -- just the cert/key pair.
+render-nginx-stream() {
+ local name="${1}" certFileVar="${2}" certKeyVar="${3}"
+ local tmpl="${scriptdir}/conf/nginx/stream-templates/${name}.conf.template"
+ local out="${scriptdir}/conf/nginx/stream-available/${name}.conf"
+ [ -f "${tmpl}" ] || return 0
+ if [ -n "${!certFileVar}" ] && [ -n "${!certKeyVar}" ]; then
+  envsubst "\${${certFileVar}} \${${certKeyVar}}" < "${tmpl}" > "${out}"
+ else
+  rm -f "${out}"
+ fi
+}
+render-nginx-stream mqtt MQTT_CERT_FILE MQTT_CERT_KEY
+render-nginx-stream amqp AMQP_CERT_FILE AMQP_CERT_KEY
+# RabbitMQ's definitions import needs a password_hash, not the plaintext
+# password -- compute it the same way `rabbitmqctl` does
+# (rabbit_password_hashing_sha256: base64(4-byte salt ++ sha256(salt ++ password))).
+rabbitmq-password-hash() {
+ python3 -c "
+import hashlib, base64, os, sys
+salt = os.urandom(4)
+digest = hashlib.sha256(salt + sys.argv[1].encode()).digest()
+print(base64.b64encode(salt + digest).decode())
+" "${1}"
+}
+
+if [ -f "${scriptdir}/conf/rabbitmq/definitions.json.template" ]; then
+ if [ -z "${RABBITMQ_USER}" ] || [ -z "${RABBITMQ_PASSWORD}" ] || [ -z "${RABBITMQ_SENDER_USER}" ] || [ -z "${RABBITMQ_SENDER_PASSWORD}" ]; then
+  echo "warning: RABBITMQ_USER/RABBITMQ_PASSWORD/RABBITMQ_SENDER_USER/RABBITMQ_SENDER_PASSWORD not set in .env -- leaving conf/rabbitmq/definitions.json untouched" >&2
+ else
+  export RABBITMQ_PASSWORD_HASH=$(rabbitmq-password-hash "${RABBITMQ_PASSWORD}")
+  export RABBITMQ_SENDER_PASSWORD_HASH=$(rabbitmq-password-hash "${RABBITMQ_SENDER_PASSWORD}")
+  envsubst < "${scriptdir}/conf/rabbitmq/definitions.json.template" > "${scriptdir}/conf/rabbitmq/definitions.json"
+ fi
+fi
+
+composeLive=(-f "${scriptdir}/docker.live.yaml")
+composeTrain=()
+[ -f "${scriptdir}/docker.train.base.yaml" ] && composeTrain+=(-f "${scriptdir}/docker.train.base.yaml")
+[ -f "${scriptdir}/docker.train.apps.yaml" ] && composeTrain+=(-f "${scriptdir}/docker.train.apps.yaml")
+if [ "${env}" = "dev" ] || [ "${env}" = "test" ]; then
+ composeLive+=("-f" "${scriptdir}/docker.live.override.yaml")
+ [ -f "${scriptdir}/docker.train.override.yaml" ] && composeTrain+=("-f" "${scriptdir}/docker.train.override.yaml")
+ # Duplicate keys in an env file are last-wins, so this overrides the
+ # blank/relative URLs meant for prod's nginx setup with dev's direct,
+ # no-reverse-proxy access (see docker-compose.dev.yaml).
+ [ -f "${scriptdir}/chatbot/dify.env.dev.template" ] && envsubst < "${scriptdir}/chatbot/dify.env.dev.template" >> "${scriptdir}/chatbot/dify.env"
+fi
+
+init() {
+ echo "init"
+}
+
+rm-all() {
+ if [ "${srv}" == "live" ] || [ "${srv}" == "both" ]; then
+  docker compose "${composeLive[@]}" down --rmi local
+ fi
+ if ([ "${srv}" == "train" ] || [ "${srv}" == "both" ]) && [ ${#composeTrain[@]} -gt 0 ]; then
+  docker compose "${composeTrain[@]}" down --rmi local
+ fi
+ sudo rm -rf data
+}
+
+down() {
+ if [ "${srv}" == "live" ] || [ "${srv}" == "both" ]; then
+  docker compose "${composeLive[@]}" down
+ fi
+ if ([ "${srv}" == "train" ] || [ "${srv}" == "both" ]) && [ ${#composeTrain[@]} -gt 0 ]; then
+  docker compose "${composeTrain[@]}" down
+ fi
+}
+
+
+db() {
+ local sql="${1}"
+ local db="${2:-optisolar}"
+ if [ -z "${sql}" ]; then
+  echo "usage: ${0} db <sql-statement> [database-name]"
+  exit 1
+ fi
+ if [[ -t 0 ]]; then
+  docker exec -it database mariadb -u root -p${DB_PASSWORD} "${db}" -e "${sql}"
+ else
+  docker exec -i database mariadb -u root -p${DB_PASSWORD} "${db}" -e "${sql}"
+ fi
+}
+db-login() {
+ db=$(get-param 1 "naziv baze podataka" -v "${1}" -d optisolar)
+ docker exec -it database mariadb -u root -p${DB_PASSWORD} ${db}
+}
+db-upgrade() {
+ db=$(get-param 1 "naziv baze podataka" -v "${1}" -d optisolar)
+ full=$(get-param 0 "full" -v "${2}")
+ if [ ! -z "${full}" ] && [ "${full}" != "--full" ]; then unset full; fi
+ docker run --rm -v "${scriptdir}/database:/db:ro" --network os -p 49999:3306 mariadb:11.8.1-ubi9-rc /db/updater/dbupgrade /db/${db} --demo ${full} -h database -uroot -p${DB_PASSWORD} ${db}
+}
+db-downgrade() {
+ db=$(get-param 1 "naziv baze podataka" -v "${1}" -d optisolar)
+ docker run --rm -v "${scriptdir}/database:/db:ro" --network os -p 49999:3306 mariadb:11.8.1-ubi9-rc /db/updater/dbdowngrade /db/${db} --demo -h database -uroot -p${DB_PASSWORD} ${db}
+}
+db-dump() {
+ db=$(get-param 1 "naziv baze podataka" -v "${1}" -d optisolar)
+ docker exec database mariadb-dump -h ${DB_HOST} -u ${DB_USER} -p${DB_PASSWORD} ${db} --no-create-info --insert-ignore > ${db}.dump.`date "+%Y%m%d"`.sql
+}
+
+update() {
+ local service="${1}"
+ docker login "${repoURL}" -u "${repoUser}" -p"${repoPass}" > /dev/null 2>&1
+ if [ "${srv}" == "live" ] || [ "${srv}" == "both" ]; then
+  docker compose "${composeLive[@]}" pull ${service}
+  docker compose "${composeLive[@]}" up -d --no-build --force-recreate ${service}
+ fi
+ if ([ "${srv}" == "train" ] || [ "${srv}" == "both" ]) && [ ${#composeTrain[@]} -gt 0 ]; then
+  docker compose "${composeTrain[@]}" pull ${service}
+  docker compose "${composeTrain[@]}" up -d --no-build --force-recreate ${service}
+ fi
+}
+
+setup-live-backup() {
+ if [ "${srv}" = "live" ]; then
+  weekly_bkp="0 0 * * 0 /base/optisolar/osai bkp-db-weekly >> /base/logs/cron-backup.log 2>&1"
+  daily_bkp="0 2 * * 1,2,3,4,5,6 /base/optisolar/osai bkp-db-daily >> /base/logs/cron-backup.log 2>&1"
+  hourly_bkp="30 * * * * /base/optisolar/osai bkp-db-hourly >> /base/logs/cron-backup.log 2>&1"
+  (crontab -l 2>/dev/null | grep -v -F "bkp-db-weekly"; echo "${weekly_bkp}") | crontab -
+  (crontab -l 2>/dev/null | grep -v -F "bkp-db-daily"; echo "${daily_bkp}") | crontab -
+  (crontab -l 2>/dev/null | grep -v -F "bkp-db-hourly"; echo "${hourly_bkp}") | crontab -
+ else
+  echo "greška: nije live okruženje!"
+  exit 1
+ fi
+}
+
+full-help() {
+ local start=${1}
+ local hlp1=$(show-help)
+ local hlp2
+ if [[ -f "${scriptdir}/osai-dev" ]]; then
+  hlp2=$(. "${scriptdir}/osai-dev" --help)
+ fi
+ if [ -z "${start}" ]; then
+  less -RFX <<EOF
+${hlp1}
+
+${hlp2}
+EOF
+ else
+  less -RFX <<EOF
+
+${start}
+
+${hlp1}
+
+${hlp2}
+EOF
+ fi
+}
+
+cmd=${1}
+shift
+
+case "${cmd}" in
+ init)                 init;;
+ update)               update "${@}";;
+ db)                   db "${@}";;
+ db-login)             db-login "${@}";;
+ db-upgrade)           db-upgrade "${@}";;
+ db-downgrade)         db-downgrade "${@}";;
+ db-dump)              db-dump "${@}";;
+ rm-all)               rm-all;;
+ down)                 down;;
+ chatbot-down)         chatbot-down;;
+ chatbot-update)       chatbot-update "${@}";;
+ bkp-db-weekly)        bkp-db-weekly;;
+ bkp-db-daily)         bkp-db-daily "${@}";;
+ bkp-db-hourly)        bkp-db-hourly "${@}";;
+ bkp-models)           bkp-models "${@}";;
+ restore-db-local)     restore-db-from-local "${@}";;
+ restore-models-local) restore-models-from-local "${@}";;
+ bkp-to-cloud)         bkp-to-cloud;;
+ restore-from-cloud)   restore-from-cloud "${@}";;
+ setup-live-backup)    setup-live-backup;;
+ help|""|-h|--help)
+  full-help
+  exit 0;;
+ *)
+  if [[ -f "${scriptdir}/osai-dev" ]]; then
+   "${scriptdir}/osai-dev" ${cmd} "${@}"
+   ec=${?}
+   if [ ${ec} -eq 255 ]; then
+    full-help
+   fi
+   exit ${ec}
+  fi
+  echo "${0}: unknown command '${cmd}'" >&2
+  show-help
+  exit 1;;
+esac
