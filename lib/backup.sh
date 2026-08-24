@@ -675,3 +675,158 @@ install-cron() {
  log-line msg "  hourly : ${CronHourly}"
  log-line msg "logs will be appended to ${LogFile}"
 }
+
+###################################################################################################
+############################################# STATUS ###############################################
+###################################################################################################
+
+format-backup-ts() {
+ local ts="${1}"
+ [ -z "${ts}" ] && return
+ date -u -d "${ts:0:4}-${ts:4:2}-${ts:6:2} ${ts:8:2}:${ts:10:2}:${ts:12:2}" +"%Y-%m-%d %H:%M:%S UTC" 2>/dev/null
+}
+
+slave-status-field() {
+ local text="${1}"
+ local field="${2}"
+ echo "${text}" | grep -E "^ *${field}: " | head -1 | sed -E "s/^ *${field}: ?//"
+}
+
+status-db() {
+ echo "${BOLD}${CYAN}Database${RESET}"
+ dbUp=false
+ if [ -n "${DBContainerName}" ] && docker ps --filter "name=^/${DBContainerName}$" --filter "status=running" -q 2>/dev/null | grep -q .; then
+  if docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SELECT 1" >/dev/null 2>&1; then
+   dbUp=true
+  fi
+ fi
+ if [ "${dbUp}" = true ]; then
+  echo "  container ${DBContainerName}: ${GREEN}UP${RESET} (accepting connections)"
+ else
+  echo "  container ${DBContainerName}: ${RED}DOWN${RESET} (not running, or not accepting connections)"
+ fi
+ echo
+}
+
+status-schedule() {
+ echo "${BOLD}${CYAN}Backup schedule (cron)${RESET}"
+ local exe="${scriptDir}/bkp"
+ local cronList
+ cronList=$(crontab -l 2>/dev/null)
+ local level
+ for level in weekly daily hourly; do
+  local pattern="${exe} bkp-db-${level}"
+  local line
+  line=$(echo "${cronList}" | grep -F "${pattern}" | head -1)
+  if [ -n "${line}" ]; then
+   local schedule
+   schedule=$(echo "${line}" | awk '{print $1, $2, $3, $4, $5}')
+   echo "  ${level}: ${GREEN}installed${RESET} (schedule: ${schedule})"
+  else
+   echo "  ${level}: ${YELLOW}not installed${RESET}"
+  fi
+ done
+ echo
+}
+
+status-local-backups() {
+ echo "${BOLD}${CYAN}Local backups${RESET}"
+ load-state
+ if [ -n "${lastFullTs}" ]; then
+  echo "  last full backup:        ${lastFullTs} ($(format-backup-ts "${lastFullTs}"))"
+ else
+  echo "  last full backup:        none"
+ fi
+ if [ -n "${lastIncTs}" ]; then
+  echo "  last incremental backup: ${lastIncTs} ($(format-backup-ts "${lastIncTs}"))"
+ else
+  echo "  last incremental backup: none"
+ fi
+ echo
+}
+
+status-cloud-backups() {
+ echo "${BOLD}${CYAN}Cloud backups${RESET}"
+ if [ "${CloudProvider}" != "gcloud" ] || [ -z "${GCSBucket}" ]; then
+  echo "  not configured (CloudProvider=${CloudProvider:-unset}, GCSBucket=${GCSBucket:-unset})"
+  echo
+  return
+ fi
+ local candidates
+ candidates=$(gcloud storage ls "gs://${GCSBucket}/*-backup.${BackupInstanceName}.*.tar.bz2.aes256" 2>/dev/null | grep -E ".*-backup\.${BackupInstanceName}\.[0-9]{14}\.tar\.bz2\.aes256$")
+ if [ -z "${candidates}" ]; then
+  echo "  no backups found in gs://${GCSBucket}/"
+  echo
+  return
+ fi
+ local latestFile="" latestTs="00000000000000"
+ local line
+ while IFS= read -r line; do
+  local filename fileTs
+  filename=$(basename "${line}")
+  fileTs=$(echo "${filename}" | grep -oE '[0-9]{14}' || echo "00000000000000")
+  if [[ "${fileTs}" > "${latestTs}" ]]; then
+   latestTs="${fileTs}"
+   latestFile="${line}"
+  fi
+ done <<< "${candidates}"
+ local level
+ level=$(basename "${latestFile}" | cut -d'-' -f1)
+ echo "  last upload: ${level} backup, ${latestTs} ($(format-backup-ts "${latestTs}"))"
+ echo "  object:      ${latestFile}"
+ echo
+}
+
+status-replication() {
+ echo "${BOLD}${CYAN}Replication${RESET}"
+ if [ "${dbUp}" != true ]; then
+  echo "  cannot check (database is down)"
+  echo
+  return
+ fi
+ local slaveStatus
+ slaveStatus=$(docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SHOW SLAVE STATUS\G" 2>/dev/null)
+ if [ -z "${slaveStatus}" ]; then
+  echo "  not a replica"
+  echo
+  return
+ fi
+ local ioRunning sqlRunning masterLogFile readPos relayMasterLogFile execPos secondsBehind lastSqlErr lastIoErr
+ ioRunning=$(slave-status-field "${slaveStatus}" "Slave_IO_Running")
+ sqlRunning=$(slave-status-field "${slaveStatus}" "Slave_SQL_Running")
+ masterLogFile=$(slave-status-field "${slaveStatus}" "Master_Log_File")
+ readPos=$(slave-status-field "${slaveStatus}" "Read_Master_Log_Pos")
+ relayMasterLogFile=$(slave-status-field "${slaveStatus}" "Relay_Master_Log_File")
+ execPos=$(slave-status-field "${slaveStatus}" "Exec_Master_Log_Pos")
+ secondsBehind=$(slave-status-field "${slaveStatus}" "Seconds_Behind_Master")
+ lastSqlErr=$(slave-status-field "${slaveStatus}" "Last_SQL_Error")
+ lastIoErr=$(slave-status-field "${slaveStatus}" "Last_IO_Error")
+ echo "  role: replica"
+ if [ "${ioRunning}" = "Yes" ] && [ "${sqlRunning}" = "Yes" ]; then
+  echo "  status: ${GREEN}running${RESET} (IO=${ioRunning}, SQL=${sqlRunning})"
+ else
+  echo "  status: ${RED}NOT running${RESET} (IO=${ioRunning}, SQL=${sqlRunning})"
+ fi
+ echo "  master log file:  ${masterLogFile} (read pos ${readPos})"
+ echo "  relay master log: ${relayMasterLogFile} (exec pos ${execPos})"
+ echo "  seconds behind master: ${secondsBehind}"
+ if [ -n "${lastSqlErr}" ]; then
+  echo "  last error: ${RED}${lastSqlErr}${RESET}"
+ elif [ -n "${lastIoErr}" ]; then
+  echo "  last error: ${RED}${lastIoErr}${RESET}"
+ else
+  echo "  last error: none"
+ fi
+ echo
+}
+
+status() {
+ local dbUp=false
+ echo "${BOLD}=== bkp status (${BackupInstanceName}) ===${RESET}"
+ echo
+ status-db
+ status-schedule
+ status-local-backups
+ status-cloud-backups
+ status-replication
+}

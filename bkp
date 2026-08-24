@@ -4,12 +4,14 @@ if [[ -t 1 ]]; then
  BOLD=$(tput bold 2>/dev/null || echo '')
  RED=$(tput setaf 1)
  YELLOW=$(tput setaf 3)
+ GREEN=$(tput setaf 2)
  CYAN=$(tput setaf 6)
  RESET=$(tput sgr0)
 else
  BOLD=
  RED=
  YELLOW=
+ GREEN=
  CYAN=
  RESET=
 fi
@@ -61,6 +63,11 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
   ${BOLD}install-cron${RESET}
    - installs weekly/daily/hourly backups as cron jobs, per the ${BOLD}Cron*${RESET} schedule in ${BOLD}.env${RESET}
    - backup to cloud runs automatically after each weekly and daily backup
+
+  ${BOLD}status${RESET}
+   - shows whether the configured database is reachable, whether the backup cron schedule is installed
+   - shows the timestamp of the last local backup and the last backup uploaded to cloud
+   - if the database is a replica, shows replication status (log files, positions, seconds behind master, last error)
 
   ${BOLD}help${RESET} | ${BOLD}""${RESET} | ${BOLD}-h${RESET} | ${BOLD}--help${RESET}
    - displays this help message
@@ -132,6 +139,7 @@ case "${cmd}" in
  restore-folders-local) restore-folders-local "${@}";;
  restore-from-cloud)    restore-from-cloud "${@}";;
  install-cron)          install-cron;;
+ status)                status;;
  help|""|-h|--help)
   show-help
   exit 0;;
