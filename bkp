@@ -24,6 +24,15 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
  ${CYAN}= Backup/restore =${RESET}
  ${CYAN}=================${RESET}
 
+  ${BOLD}db-start${RESET}
+   - starts ${BOLD}\${DBContainerName}${RESET} if it isn't running, and waits (up to 60s) for it to accept connections
+   - reports whether the container failed to start, started but never became healthy, or is up and healthy
+
+  ${BOLD}restart-replication${RESET}
+   - stops and starts replication (${BOLD}STOP SLAVE${RESET} / ${BOLD}START SLAVE${RESET}) on ${BOLD}\${DBContainerName}${RESET}
+   - does nothing if the database isn't up, or if it isn't configured as a replica
+   - reports whether IO/SQL threads end up running, and the last replication error if not
+
   ${BOLD}bkp-db-weekly${RESET}
    - performs a weekly (full) backup of the database
    - any existing lower-priority backup processes (daily or hourly) will be terminated
@@ -61,7 +70,8 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
    - restores the most recent encrypted archive at or before ${BOLD}[target-datetime]${RESET} (format: yyyy-MM-dd HH:mm:ss, default: now) from ${BOLD}gs://\${GCSBucket}/${RESET}, decrypts it, extracts it, and moves the files into ${BOLD}\${LocalBackupDir}${RESET}
 
   ${BOLD}install-cron${RESET}
-   - installs weekly/daily/hourly backups as cron jobs, per the ${BOLD}Cron*${RESET} schedule in ${BOLD}.env${RESET}
+   - installs (or re-installs) weekly/daily/hourly backups as cron jobs, per the ${BOLD}Cron*${RESET} schedule in ${BOLD}.env${RESET}
+   - safe to re-run any time: replaces any previously installed entries for this script rather than duplicating them
    - backup to cloud runs automatically after each weekly and daily backup
 
   ${BOLD}status${RESET}
@@ -139,6 +149,8 @@ case "${cmd}" in
  restore-folders-local) restore-folders-local "${@}";;
  restore-from-cloud)    restore-from-cloud "${@}";;
  install-cron)          install-cron;;
+ db-start)              db-start;;
+ restart-replication)   restart-replication;;
  status)                status;;
  help|""|-h|--help)
   show-help

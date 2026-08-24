@@ -12,6 +12,7 @@ LOCK_FD_HOURLY=202
 
 ALPINE_IMAGE="alpine:3.22"
 BINLOG_UTILITY_IMAGE="bash:5.2.21-alpine3.19"
+DB_START_TIMEOUT_SECONDS=60
 
 scriptName=$(basename "${0}")
 
@@ -106,6 +107,42 @@ wait-for-db() {
   sleep 1
  done
  log-line msg "MariaDB is ready"
+}
+
+###################################################################################################
+######################################## DATABASE CONTROL #########################################
+###################################################################################################
+
+db-start() {
+ require-db-type
+ require-vars DBContainerName DBUser DBPassword
+ log-line msg "=== STARTING DATABASE CONTAINER ==="
+ if ! docker ps -a --filter "name=^/${DBContainerName}$" -q 2>/dev/null | grep -q .; then
+  log-line err "no container named '${DBContainerName}' exists"
+  return 1
+ fi
+ if docker ps --filter "name=^/${DBContainerName}$" --filter "status=running" -q 2>/dev/null | grep -q .; then
+  log-line msg "container ${DBContainerName} is already running"
+ elif ! docker start "${DBContainerName}" >/dev/null; then
+  log-line err "container ${DBContainerName} didn't start"
+  return 1
+ fi
+ log-line msg "waiting up to ${DB_START_TIMEOUT_SECONDS}s for ${DBContainerName} to accept connections..."
+ local waited=0
+ while [ "${waited}" -lt "${DB_START_TIMEOUT_SECONDS}" ]; do
+  if ! docker ps --filter "name=^/${DBContainerName}$" --filter "status=running" -q 2>/dev/null | grep -q .; then
+   log-line err "container ${DBContainerName} stopped unexpectedly while waiting for it to become healthy"
+   return 1
+  fi
+  if docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SELECT 1" >/dev/null 2>&1; then
+   log-line msg "=== DATABASE CONTAINER UP AND HEALTHY ==="
+   return 0
+  fi
+  sleep 2
+  waited=$((waited + 2))
+ done
+ log-line err "container ${DBContainerName} started but did not accept connections within ${DB_START_TIMEOUT_SECONDS}s"
+ return 1
 }
 
 ###################################################################################################
@@ -704,6 +741,7 @@ status-db() {
   echo "  container ${DBContainerName}: ${GREEN}UP${RESET} (accepting connections)"
  else
   echo "  container ${DBContainerName}: ${RED}DOWN${RESET} (not running, or not accepting connections)"
+  echo "    -> run '${scriptName} db-start' to start it"
  fi
  echo
 }
@@ -713,6 +751,7 @@ status-schedule() {
  local exe="${scriptDir}/bkp"
  local cronList
  cronList=$(crontab -l 2>/dev/null)
+ local missingCron=false
  local level
  for level in weekly daily hourly; do
   local pattern="${exe} bkp-db-${level}"
@@ -724,8 +763,10 @@ status-schedule() {
    echo "  ${level}: ${GREEN}installed${RESET} (schedule: ${schedule})"
   else
    echo "  ${level}: ${YELLOW}not installed${RESET}"
+   missingCron=true
   fi
  done
+ [ "${missingCron}" = true ] && echo "    -> run '${scriptName} install-cron' to (re)install the schedule from .env"
  echo
 }
 
@@ -806,6 +847,7 @@ status-replication() {
   echo "  status: ${GREEN}running${RESET} (IO=${ioRunning}, SQL=${sqlRunning})"
  else
   echo "  status: ${RED}NOT running${RESET} (IO=${ioRunning}, SQL=${sqlRunning})"
+  echo "    -> run '${scriptName} restart-replication' to (re)start it"
  fi
  echo "  master log file:  ${masterLogFile} (read pos ${readPos})"
  echo "  relay master log: ${relayMasterLogFile} (exec pos ${execPos})"
@@ -818,6 +860,43 @@ status-replication() {
   echo "  last error: none"
  fi
  echo
+}
+
+restart-replication() {
+ require-db-type
+ require-vars DBContainerName DBUser DBPassword
+ if ! docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SELECT 1" >/dev/null 2>&1; then
+  log-line err "database is not up - run '${scriptName} db-start' first"
+  return 1
+ fi
+ local slaveStatus
+ slaveStatus=$(docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SHOW SLAVE STATUS\G" 2>/dev/null)
+ if [ -z "${slaveStatus}" ]; then
+  log-line err "not a replica (no SHOW SLAVE STATUS output) - nothing to restart"
+  return 1
+ fi
+ log-line msg "=== RESTARTING REPLICATION ==="
+ docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "STOP SLAVE;" 2>/dev/null
+ if ! docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "START SLAVE;" 2>/dev/null; then
+  log-line err "failed to issue START SLAVE"
+  return 1
+ fi
+ sleep 2
+ slaveStatus=$(docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SHOW SLAVE STATUS\G" 2>/dev/null)
+ local ioRunning sqlRunning lastSqlErr lastIoErr
+ ioRunning=$(slave-status-field "${slaveStatus}" "Slave_IO_Running")
+ sqlRunning=$(slave-status-field "${slaveStatus}" "Slave_SQL_Running")
+ lastSqlErr=$(slave-status-field "${slaveStatus}" "Last_SQL_Error")
+ lastIoErr=$(slave-status-field "${slaveStatus}" "Last_IO_Error")
+ if [ "${ioRunning}" = "Yes" ] && [ "${sqlRunning}" = "Yes" ]; then
+  log-line msg "=== REPLICATION RUNNING (IO=${ioRunning}, SQL=${sqlRunning}) ==="
+  return 0
+ else
+  log-line err "replication still not running (IO=${ioRunning}, SQL=${sqlRunning})"
+  [ -n "${lastSqlErr}" ] && log-line err "last SQL error: ${lastSqlErr}"
+  [ -n "${lastIoErr}" ] && log-line err "last IO error: ${lastIoErr}"
+  return 1
+ fi
 }
 
 status() {
