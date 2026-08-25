@@ -815,8 +815,16 @@ status-cloud-backups() {
   echo
   return
  fi
+ local lsOutput lsExit
+ lsOutput=$(gcloud storage ls "gs://${GCSBucket}/*-backup.${BackupInstanceName}.*.tar.bz2.aes256" 2>&1)
+ lsExit=${?}
+ if [ ${lsExit} -ne 0 ] && ! grep -qi "matched no objects" <<< "${lsOutput}"; then
+  echo "  ${RED}unable to reach gs://${GCSBucket}/${RESET} - check your internet/network connection"
+  echo
+  return
+ fi
  local candidates
- candidates=$(gcloud storage ls "gs://${GCSBucket}/*-backup.${BackupInstanceName}.*.tar.bz2.aes256" 2>/dev/null | grep -E ".*-backup\.${BackupInstanceName}\.[0-9]{14}\.tar\.bz2\.aes256$")
+ candidates=$(grep -E ".*-backup\.${BackupInstanceName}\.[0-9]{14}\.tar\.bz2\.aes256$" <<< "${lsOutput}")
  if [ -z "${candidates}" ]; then
   echo "  no backups found in gs://${GCSBucket}/"
   echo
