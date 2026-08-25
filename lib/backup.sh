@@ -13,6 +13,8 @@ LOCK_FD_HOURLY=202
 ALPINE_IMAGE="alpine:3.22"
 BINLOG_UTILITY_IMAGE="bash:5.2.21-alpine3.19"
 DB_START_TIMEOUT_SECONDS=60
+FULL_BACKUP_MAX_AGE_DAYS=8
+FULL_BACKUP_MAX_AGE_SECONDS=$((FULL_BACKUP_MAX_AGE_DAYS * 86400))
 
 scriptName=$(basename "${0}")
 
@@ -79,6 +81,16 @@ lastFullTs="${lastFullTs}"
 lastIncTs="${lastIncTs}"
 EOF
  chmod 600 "${stateFile}"
+}
+
+full-backup-stale() {
+ local fullTs="${1}"
+ [[ -z "${fullTs}" ]] && return 0
+ local fullEpoch
+ fullEpoch=$(date -u -d "${fullTs:0:4}-${fullTs:4:2}-${fullTs:6:2} ${fullTs:8:2}:${fullTs:10:2}:${fullTs:12:2}" +%s 2>/dev/null) || return 0
+ local nowEpoch
+ nowEpoch=$(date -u +%s)
+ [ $((nowEpoch - fullEpoch)) -gt "${FULL_BACKUP_MAX_AGE_SECONDS}" ]
 }
 
 extract-xbstream() {
@@ -232,10 +244,14 @@ bkp-db-daily() {
  terminate-lower-priority 2
  load-state
  local fullTs="${lastFullTs}"
- if [[ -z "${fullTs}" ]] && [[ -z "${1}" ]]; then
-  log-line err "no valid full backup found and no parameter is given - falling back to full backup"
+ if [[ -z "${1}" ]] && full-backup-stale "${fullTs}"; then
+  if [[ -z "${fullTs}" ]]; then
+   log-line err "no valid full backup found and no parameter is given - falling back to full backup"
+  else
+   log-line msg "last full backup (${fullTs}) is older than ${FULL_BACKUP_MAX_AGE_DAYS} days - running full backup instead"
+  fi
+  release-lock "${lockDaily}" ${LOCK_FD_DAILY}
   bkp-db-weekly
-  rm -f "${lockDaily}"
   return ${?}
  elif [[ -n "${1}" ]]; then
   fullTs="${1}"
@@ -314,9 +330,15 @@ bkp-db-hourly() {
  acquire-lock "${lockHourly}" ${LOCK_FD_HOURLY}
  load-state
  local fullTs="${lastFullTs}"
- if [[ -z "${fullTs}" ]] && [[ -z "${1}" ]]; then
-  log-line wrn "no full backup exists yet - skipping binlog backup"
-  return 0
+ if [[ -z "${1}" ]] && full-backup-stale "${fullTs}"; then
+  if [[ -z "${fullTs}" ]]; then
+   log-line wrn "no full backup exists yet - running full backup instead of binlog backup"
+  else
+   log-line msg "last full backup (${fullTs}) is older than ${FULL_BACKUP_MAX_AGE_DAYS} days - running full backup instead"
+  fi
+  release-lock "${lockHourly}" ${LOCK_FD_HOURLY}
+  bkp-db-weekly
+  return ${?}
  elif [[ -n "${1}" ]]; then
   fullTs="${1}"
  fi
