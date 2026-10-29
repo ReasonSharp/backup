@@ -51,6 +51,7 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
    - if any higher priority backup process (weekly or daily) is running, this will do nothing
    - if there are no previous full backups, or the latest one is older than 8 days, this runs ${BOLD}bkp-db-weekly${RESET} instead (only when no [timestamp] is given)
    - the binlogs are stored locally in ${BOLD}\${LocalBackupDir}/<timestamp>/mariadb/binlogs${RESET}
+   - if replication is healthy (IO and SQL threads both running), also purges binlogs on the server older than 14 days (${BOLD}PURGE BINARY LOGS${RESET}); skipped if the database isn't a healthy replica
 
   ${BOLD}bkp-folders${RESET} <timestamp>
    - backs up the folders configured in ${BOLD}BackupFolders${RESET} to ${BOLD}\${LocalBackupDir}/<timestamp>/files${RESET}

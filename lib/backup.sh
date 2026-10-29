@@ -15,6 +15,7 @@ BINLOG_UTILITY_IMAGE="bash:5.2.21-alpine3.19"
 DB_START_TIMEOUT_SECONDS=60
 FULL_BACKUP_MAX_AGE_DAYS=8
 FULL_BACKUP_MAX_AGE_SECONDS=$((FULL_BACKUP_MAX_AGE_DAYS * 86400))
+BINLOG_PURGE_MAX_AGE_DAYS=14
 
 scriptName=$(basename "${0}")
 
@@ -97,14 +98,12 @@ extract-xbstream() {
  local streamFile="${1}"
  local targetDir="${2}"
  log-line msg "extracting ${streamFile} -> ${targetDir}"
- local tmpStream="${targetDir}/$(basename "${streamFile}")"
  mkdir -p "${targetDir}"
- rsync -a --delete "${streamFile}" "${tmpStream}"
  docker run --rm \
+  -v "$(dirname "${streamFile}")":/source:ro \
   -v "${targetDir}":/workdir \
-  "${DBBackupImage}" sh -c 'cd /workdir && mbstream -x < "'"$(basename "${streamFile}")"'"
+  "${DBBackupImage}" sh -c 'cd /workdir && mbstream -x < "/source/'"$(basename "${streamFile}")"'"
                      chown -R '$(id -u)':'$(id -g)' /workdir'
- rm -f "${tmpStream}"
 }
 remove-extracted() {
  docker run --rm -v "$(dirname "${1}")":/workdir:rw "${ALPINE_IMAGE}" rm -rf /workdir/$(basename "${1}")
@@ -180,6 +179,7 @@ bkp-db-weekly() {
    break
   fi
  done
+ local remotePassword="${DBRemotePassword:-${DBPassword}}"
  mkdir -p "${fullDir}"
  if docker run --rm --name "mariadb-backup-full-${ts}" \
                --log-driver none \
@@ -193,7 +193,7 @@ bkp-db-weekly() {
                                        --host="'"${DBHost}"'" \
                                        --port="'"${DBPort}"'" \
                                        --user="'"${DBUser}"'" \
-                                       --password="'"${DBPassword}"'"
+                                       --password="'"${remotePassword}"'"
                         chown -R "'"$(id -u)":"$(id -g)"'" /backup' 2> /dev/null > "${streamFile}"; then
   log-line msg "backup file successfully created at ${streamFile}"
   if [[ -n "${prevBkp}" ]]; then
@@ -287,6 +287,7 @@ bkp-db-daily() {
  extractDir=$(mktemp -d)
  extract-xbstream "${lastStream}" "${extractDir}"
  local streamFile="${incDir}/backup.xbstream"
+ local remotePassword="${DBRemotePassword:-${DBPassword}}"
  mkdir -p "${incDir}"
  if docker run --rm --name "mariadb-backup-inc-${ts}" \
                --log-driver none \
@@ -302,7 +303,7 @@ bkp-db-daily() {
                                        --host="'"${DBHost}"'" \
                                        --port="'"${DBPort}"'" \
                                        --user="'"${DBUser}"'" \
-                                       --password="'"${DBPassword}"'"
+                                       --password="'"${remotePassword}"'"
                         chown -R "'"$(id -u)":"$(id -g)"'" /backup' > "${streamFile}" 2> /dev/null; then
   log-line msg "backup file successfully created at ${streamFile}"
   remove-extracted "${extractDir}"
@@ -321,7 +322,7 @@ bkp-db-daily() {
 }
 bkp-db-hourly() {
  require-db-type
- require-vars DBDataDir DBBinlogBasename
+ require-vars DBDataDir DBBinlogBasename DBContainerName DBUser DBPassword
  if higher-priority-running "${lockWeekly}" || higher-priority-running "${lockDaily}"; then
   log-line wrn "higher priority backup running - skipping hourly"
   return 1
@@ -371,6 +372,7 @@ bkp-db-hourly() {
                                                done
                                                chown '$(id -u)':'$(id -g)' "/target/"*'; then
   log-line msg "binlogs successfully copied to ${binlogDir}/"
+  purge-old-binlogs
   log-line msg "=== HOURLY BACKUP COMPLETED ==="
  else
   log-line err "hourly backup failed with code ${?}"
@@ -749,6 +751,36 @@ slave-status-field() {
  local text="${1}"
  local field="${2}"
  echo "${text}" | grep -E "^ *${field}: " | head -1 | sed -E "s/^ *${field}: ?//"
+}
+
+purge-old-binlogs() {
+ require-vars DBContainerName DBUser DBPassword
+ if ! docker ps --filter "name=^/${DBContainerName}$" --filter "status=running" -q 2>/dev/null | grep -q .; then
+  log-line msg "database is not up - skipping binlog purge"
+  return 1
+ fi
+ local slaveStatus
+ slaveStatus=$(docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SHOW SLAVE STATUS\G" 2>/dev/null)
+ if [ -z "${slaveStatus}" ]; then
+  log-line msg "not a replica - skipping binlog purge"
+  return 1
+ fi
+ local ioRunning sqlRunning
+ ioRunning=$(slave-status-field "${slaveStatus}" "Slave_IO_Running")
+ sqlRunning=$(slave-status-field "${slaveStatus}" "Slave_SQL_Running")
+ if [ "${ioRunning}" != "Yes" ] || [ "${sqlRunning}" != "Yes" ]; then
+  log-line wrn "replication not healthy (IO=${ioRunning}, SQL=${sqlRunning}) - skipping binlog purge"
+  return 1
+ fi
+ local purgeBefore
+ purgeBefore=$(date -u -d "-${BINLOG_PURGE_MAX_AGE_DAYS} days" +"%Y-%m-%d %H:%M:%S")
+ log-line msg "replication healthy - purging binlogs older than ${purgeBefore} UTC"
+ if docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "PURGE BINARY LOGS BEFORE '${purgeBefore}';" 2>/dev/null; then
+  log-line msg "old binlogs purged"
+ else
+  log-line err "failed to purge old binlogs"
+  return 1
+ fi
 }
 
 status-db() {
