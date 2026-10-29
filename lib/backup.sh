@@ -16,6 +16,8 @@ DB_START_TIMEOUT_SECONDS=60
 FULL_BACKUP_MAX_AGE_DAYS=8
 FULL_BACKUP_MAX_AGE_SECONDS=$((FULL_BACKUP_MAX_AGE_DAYS * 86400))
 BINLOG_PURGE_MAX_AGE_DAYS=14
+STATUS_MAX_LINES=48
+STATUS_MAX_COLUMNS=128
 
 scriptName=$(basename "${0}")
 
@@ -847,6 +849,11 @@ status-cloud-backups() {
   echo
   return
  fi
+ if ! command -v gcloud >/dev/null 2>&1; then
+  echo "  ${RED}gcloud CLI not found${RESET} - install the Google Cloud CLI to check cloud backups"
+  echo
+  return
+ fi
  local lsOutput lsExit
  lsOutput=$(gcloud storage ls "gs://${GCSBucket}/*-backup.${BackupInstanceName}.*.tar.bz2.aes256" 2>&1)
  lsExit=${?}
@@ -924,6 +931,61 @@ status-replication() {
  echo
 }
 
+status-disk-space() {
+ echo "${BOLD}${CYAN}Disk space${RESET}"
+ local label varName dir
+ for varName in DBDataDir LocalBackupDir; do
+  [ "${varName}" = "DBDataDir" ] && label="DB data dir:" || label="backup dir: "
+  dir="${!varName}"
+  if [ -z "${dir}" ]; then
+   echo "  ${label} not configured (${varName} is empty)"
+   continue
+  fi
+  local size avail usePct mount
+  if ! read -r size avail usePct mount < <(df -h --output=size,avail,pcent,target "${dir}" 2>/dev/null | tail -n +2) || [ -z "${size}" ]; then
+   echo "  ${label} ${RED}cannot determine${RESET} (does ${varName} exist?)"
+   continue
+  fi
+  echo "  ${label} ${avail} free of ${size} (${usePct} used, volume mounted at ${mount})"
+ done
+ echo
+}
+
+# truncates stdin to maxLines lines of at most maxCols visible characters (color codes don't count towards the width)
+limit-output() {
+ awk -v maxLines="${1}" -v maxCols="${2}" -v reset="${RESET}" '
+  function fit(line,   plain, out, visible, i, n, c, seq) {
+   plain = line
+   gsub(esc "\\[[0-9;]*[A-Za-z]|" esc "\\([A-Za-z0-9]", "", plain)
+   if (length(plain) <= maxCols) return line
+   out = ""; visible = 0; n = length(line); i = 1
+   while (i <= n && visible < maxCols - 3) {
+    c = substr(line, i, 1)
+    if (c == esc) {
+     seq = c; c = substr(line, ++i, 1); seq = seq c; i++
+     if (c == "[") {
+      while (i <= n && substr(line, i, 1) !~ /[A-Za-z]/) seq = seq substr(line, i++, 1)
+      seq = seq substr(line, i++, 1)
+     } else if (c == "(") {
+      seq = seq substr(line, i++, 1)
+     }
+     out = out seq
+     continue
+    }
+    out = out c; visible++; i++
+   }
+   return out "..." reset
+  }
+  BEGIN { esc = "\033" }
+  NR < maxLines { print fit($0); fflush(); next }
+  NR == maxLines { held = $0; next }
+  { extra++ }
+  END {
+   if (extra) print "... (" extra + 1 " more lines not shown)"
+   else if (NR >= maxLines) print fit(held)
+  }'
+}
+
 restart-replication() {
  require-db-type
  require-vars DBContainerName DBUser DBPassword
@@ -943,7 +1005,12 @@ restart-replication() {
   log-line err "failed to issue START SLAVE"
   return 1
  fi
+ check-replication-running
+}
+
+check-replication-running() {
  sleep 2
+ local slaveStatus
  slaveStatus=$(docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SHOW SLAVE STATUS\G" 2>/dev/null)
  local ioRunning sqlRunning lastSqlErr lastIoErr
  ioRunning=$(slave-status-field "${slaveStatus}" "Slave_IO_Running")
@@ -954,20 +1021,105 @@ restart-replication() {
   log-line msg "=== REPLICATION RUNNING (IO=${ioRunning}, SQL=${sqlRunning}) ==="
   return 0
  else
-  log-line err "replication still not running (IO=${ioRunning}, SQL=${sqlRunning})"
+  log-line err "replication not running (IO=${ioRunning}, SQL=${sqlRunning})"
   [ -n "${lastSqlErr}" ] && log-line err "last SQL error: ${lastSqlErr}"
   [ -n "${lastIoErr}" ] && log-line err "last IO error: ${lastIoErr}"
   return 1
  fi
 }
 
+sql-escape() {
+ local str="${1//\\/\\\\}"
+ echo "${str//\'/\\\'}"
+}
+
+# prints "<binlog file> <position>" recorded by mariadb-backup in the restored datadir
+read-restored-binlog-pos() {
+ local infoName info
+ for infoName in xtrabackup_info mariadb_backup_info; do
+  info=$(docker run --rm -v "${DBDataDir}":/datadir:ro "${ALPINE_IMAGE}" cat "/datadir/${infoName}" 2>/dev/null) && break
+  info=""
+ done
+ if [ -z "${info}" ]; then
+  log-line err "neither xtrabackup_info nor mariadb_backup_info found in ${DBDataDir} - has the database been restored from a backup?" >&2
+  log-line err "pass the coordinates explicitly: ${scriptName} start-replica <master-log-file> <master-log-pos>" >&2
+  return 1
+ fi
+ local logFile logPos
+ logFile=$(sed -nE "s/^binlog_pos *= *filename '([^']+)'.*/\1/p" <<< "${info}" | head -1)
+ logPos=$(sed -nE "s/^binlog_pos *= *.*position '?([0-9]+)'?.*/\1/p" <<< "${info}" | head -1)
+ if [ -z "${logFile}" ] || [ -z "${logPos}" ]; then
+  log-line err "cannot parse binlog file/position from the binlog_pos line in ${DBDataDir}/${infoName}" >&2
+  log-line err "pass the coordinates explicitly: ${scriptName} start-replica <master-log-file> <master-log-pos>" >&2
+  return 1
+ fi
+ log-line msg "found binlog coordinates in ${DBDataDir}/${infoName}" >&2
+ echo "${logFile} ${logPos}"
+}
+
+start-replica() {
+ require-db-type
+ require-vars DBContainerName DBUser DBPassword DBMasterHost DBMasterPort DBMasterUser DBMasterPassword
+ local masterLogFile="${1}"
+ local masterLogPos="${2}"
+ if [ -n "${masterLogFile}" ] && [ -z "${masterLogPos}" ]; then
+  log-line err "usage: ${scriptName} start-replica [<master-log-file> <master-log-pos>]"
+  return 1
+ fi
+ if ! [[ "${DBMasterPort}" =~ ^[0-9]+$ ]]; then
+  log-line err "DBMasterPort must be a number, got '${DBMasterPort}' (edit ${envFile})"
+  return 1
+ fi
+ if ! docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SELECT 1" >/dev/null 2>&1; then
+  log-line err "database is not up - run '${scriptName} db-start' first"
+  return 1
+ fi
+ local slaveStatus
+ slaveStatus=$(docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SHOW SLAVE STATUS\G" 2>/dev/null)
+ if [ -n "${slaveStatus}" ]; then
+  log-line err "already configured as a replica of $(slave-status-field "${slaveStatus}" "Master_Host") - use '${scriptName} restart-replication' instead"
+  return 1
+ fi
+ if [ -z "${masterLogFile}" ]; then
+  require-vars DBDataDir
+  local binlogPos
+  binlogPos=$(read-restored-binlog-pos) || return 1
+  read -r masterLogFile masterLogPos <<< "${binlogPos}"
+ fi
+ if ! [[ "${masterLogFile}" =~ ^[A-Za-z0-9._-]+\.[0-9]+$ ]]; then
+  log-line err "invalid master log file '${masterLogFile}' (expected e.g. mysql-bin.000123)"
+  return 1
+ fi
+ if ! [[ "${masterLogPos}" =~ ^[0-9]+$ ]]; then
+  log-line err "invalid master log position '${masterLogPos}' (expected a number)"
+  return 1
+ fi
+ log-line msg "=== STARTING REPLICATION from ${DBMasterUser}@${DBMasterHost}:${DBMasterPort} at ${masterLogFile}:${masterLogPos} ==="
+ local changeMasterSQL changeMasterOutput
+ changeMasterSQL="CHANGE MASTER TO MASTER_HOST='$(sql-escape "${DBMasterHost}")', MASTER_PORT=${DBMasterPort},"
+ changeMasterSQL+=" MASTER_USER='$(sql-escape "${DBMasterUser}")', MASTER_PASSWORD='$(sql-escape "${DBMasterPassword}")',"
+ changeMasterSQL+=" MASTER_LOG_FILE='${masterLogFile}', MASTER_LOG_POS=${masterLogPos}, MASTER_USE_GTID=no;"
+ if ! changeMasterOutput=$(docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "${changeMasterSQL}" 2>&1); then
+  log-line err "CHANGE MASTER TO failed: ${changeMasterOutput}"
+  return 1
+ fi
+ if ! docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "START SLAVE;" 2>/dev/null; then
+  log-line err "failed to issue START SLAVE"
+  return 1
+ fi
+ check-replication-running
+}
+
 status() {
  local dbUp=false
- echo "${BOLD}=== bkp status (${BackupInstanceName}) ===${RESET}"
- echo
- status-db
- status-schedule
- status-local-backups
- status-cloud-backups
- status-replication
+ {
+  echo "${BOLD}=== bkp status (${BackupInstanceName}) ===${RESET}"
+  echo
+  status-db
+  status-schedule
+  status-local-backups
+  status-cloud-backups
+  status-replication
+  status-disk-space
+ } | limit-output "${STATUS_MAX_LINES}" "${STATUS_MAX_COLUMNS}"
 }

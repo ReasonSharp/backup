@@ -33,6 +33,11 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
    - does nothing if the database isn't up, or if it isn't configured as a replica
    - reports whether IO/SQL threads end up running, and the last replication error if not
 
+  ${BOLD}start-replica${RESET} [<master-log-file> <master-log-pos>]
+   - configures ${BOLD}\${DBContainerName}${RESET} as a replica of ${BOLD}\${DBMasterHost}${RESET} (${BOLD}CHANGE MASTER TO${RESET}) using the ${BOLD}DBMaster*${RESET} settings, then runs ${BOLD}START SLAVE${RESET}
+   - without params, reads the binlog file/position from ${BOLD}xtrabackup_info${RESET} in ${BOLD}\${DBDataDir}${RESET} (left there by ${BOLD}restore-db-local${RESET})
+   - does nothing if the database isn't up, or is already configured as a replica (use ${BOLD}restart-replication${RESET} for that)
+
   ${BOLD}bkp-db-weekly${RESET}
    - performs a weekly (full) backup of the database
    - any existing lower-priority backup processes (daily or hourly) will be terminated
@@ -79,6 +84,7 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
    - shows whether the configured database is reachable, whether the backup cron schedule is installed
    - shows the timestamp of the last local backup and the last backup uploaded to cloud
    - if the database is a replica, shows replication status (log files, positions, seconds behind master, last error)
+   - shows free space on the volumes holding ${BOLD}\${DBDataDir}${RESET} and ${BOLD}\${LocalBackupDir}${RESET}
 
   ${BOLD}help${RESET} | ${BOLD}""${RESET} | ${BOLD}-h${RESET} | ${BOLD}--help${RESET}
    - displays this help message
@@ -115,6 +121,7 @@ fi
 [ -z "${DBType}" ] && DBType="mariadb"
 [ -z "${DBPort}" ] && DBPort=3306
 [ -z "${DBContainerName}" ] && DBContainerName="database"
+[ -z "${DBMasterPort}" ] && DBMasterPort=3306
 [ -z "${DBBackupImage}" ] && DBBackupImage="mariadb:11.8"
 [ -z "${LocalBackupDir}" ] && LocalBackupDir="${scriptDir}/backups"
 [ -z "${RestoreDir}" ] && RestoreDir="${scriptDir}/restored-backup"
@@ -127,7 +134,7 @@ fi
 
 # set defaults, overwrite by values already set in .env by user, then recreate .env with values already loaded + any non-overwritten defaults
 set -a
-export DBType DBPort DBContainerName DBBackupImage LocalBackupDir RestoreDir CloudProvider BackupInstanceName CronWeekly CronDaily CronHourly LogFile
+export DBType DBPort DBContainerName DBMasterPort DBBackupImage LocalBackupDir RestoreDir CloudProvider BackupInstanceName CronWeekly CronDaily CronHourly LogFile
 [ -f "${envFile}" ] && . "${envFile}"
 set +a
 envsubst < "${envTemplate}" > "${envFile}"
@@ -152,6 +159,7 @@ case "${cmd}" in
  install-cron)          install-cron;;
  db-start)              db-start;;
  restart-replication)   restart-replication;;
+ start-replica)         start-replica "${@}";;
  status)                status;;
  help|""|-h|--help)
   show-help
