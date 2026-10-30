@@ -18,6 +18,7 @@ FULL_BACKUP_MAX_AGE_SECONDS=$((FULL_BACKUP_MAX_AGE_DAYS * 86400))
 BINLOG_PURGE_MAX_AGE_DAYS=14
 STATUS_MAX_LINES=48
 STATUS_MAX_COLUMNS=128
+STATUS_CLOUD_TIMEOUT_SECONDS=5
 
 scriptName=$(basename "${0}")
 
@@ -854,11 +855,35 @@ status-cloud-backups() {
   echo
   return
  fi
- local lsOutput lsExit
- lsOutput=$(gcloud storage ls "gs://${GCSBucket}/*-backup.${BackupInstanceName}.*.tar.bz2.aes256" 2>&1)
+ # local check (no network): an uninitialized gcloud has no active credentialed account
+ local activeAccount
+ activeAccount=$(timeout -k 1 "${STATUS_CLOUD_TIMEOUT_SECONDS}" gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null)
+ if [ -z "${activeAccount}" ]; then
+  echo "  ${RED}gcloud is not initialized${RESET} (no active account) - run 'gcloud init' or 'gcloud auth login' to set it up"
+  echo
+  return
+ fi
+ # output goes to a file rather than $(...), so stray gcloud subprocesses holding the pipe open can't outlive the timeout
+ local lsOutput lsExit lsOutputFile
+ lsOutputFile=$(mktemp)
+ timeout -k 1 "${STATUS_CLOUD_TIMEOUT_SECONDS}" gcloud storage ls "gs://${GCSBucket}/*-backup.${BackupInstanceName}.*.tar.bz2.aes256" >"${lsOutputFile}" 2>&1
  lsExit=${?}
+ lsOutput=$(cat "${lsOutputFile}")
+ rm -f "${lsOutputFile}"
+ if [ ${lsExit} -eq 124 ] || [ ${lsExit} -eq 137 ]; then
+  echo "  ${RED}unable to reach gs://${GCSBucket}/${RESET} within ${STATUS_CLOUD_TIMEOUT_SECONDS}s - check your internet/network connection"
+  echo
+  return
+ fi
  if [ ${lsExit} -ne 0 ] && ! grep -qi "matched no objects" <<< "${lsOutput}"; then
-  echo "  ${RED}unable to reach gs://${GCSBucket}/${RESET} - check your internet/network connection"
+  local lsError
+  lsError=$(grep -m1 "ERROR" <<< "${lsOutput}")
+  if grep -qiE "active account|gcloud auth login|reauthenticat|credentials" <<< "${lsOutput}"; then
+   echo "  ${RED}gcloud is not authenticated${RESET} (account ${activeAccount}) - run 'gcloud auth login' to refresh credentials"
+  else
+   echo "  ${RED}unable to list gs://${GCSBucket}/${RESET} - check your internet/network connection and bucket access"
+  fi
+  [ -n "${lsError}" ] && echo "    ${lsError}"
   echo
   return
  fi
@@ -1118,8 +1143,9 @@ status() {
   status-db
   status-schedule
   status-local-backups
-  status-cloud-backups
   status-replication
   status-disk-space
+  # last, since it depends on the network and may take up to STATUS_CLOUD_TIMEOUT_SECONDS
+  status-cloud-backups
  } | limit-output "${STATUS_MAX_LINES}" "${STATUS_MAX_COLUMNS}"
 }
