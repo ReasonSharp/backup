@@ -18,7 +18,7 @@ There's no test suite; validate changes with `bash -n <file>` for syntax and by 
 ## Architecture
 
 - **`bkp`** — entrypoint. Resolves its own real path (`get-script-dir`, symlink-safe), loads `.env` if present, seeds defaults for unset vars, then **regenerates `.env` from `.env.template` via `envsubst`** on every invocation. This means: values already in `.env` survive, new variables added to `.env.template` show up empty in `.env` for the user to fill in, and defaults seeded in `bkp` (e.g. `DBType=mariadb`, `DBPort=3306`) get baked into `.env` the first time it's created. After that, it sources `lib/common.sh` and `lib/backup.sh` and dispatches to the requested command.
-- **`lib/common.sh`** — `log-line`, and config guards (`require-vars`, `require-db-type`, `require-cloud-provider`) that other functions call before touching the DB/cloud.
+- **`lib/common.sh`** — `log-line`, config guards (`require-vars`, `require-db-type`, `require-cloud-provider`) that other functions call before touching the DB/cloud, and tool checks: `bkp` warns about every missing tool in `KNOWN_TOOLS` on each run (except `status`, which lists them in its own section and degrades per section), and each command calls `require-tools` for the ones it needs, refusing to run without them.
 - **`lib/backup.sh`** — all backup/restore/cron logic, organized in sections: BACKUP DATABASE, RESTORE DATABASE, FOLDERS, CLOUD OPERATIONS, CRON.
 - **`.env.template`** → **`.env`** — the only configuration mechanism. `.env` is gitignored (holds `DBPassword`/`AESPassphrase`); `.env.template` is the source of truth for what variables exist.
 
@@ -27,10 +27,13 @@ There's no test suite; validate changes with `bash -n <file>` for syntax and by 
 Backups live under `${LocalBackupDir}/<timestamp>/mariadb/`, where `<timestamp>` is the UTC `date -u +%Y%m%d%H%M%S` of the **full** backup that anchors the chain:
 - `full/backup.xbstream` — the weekly full backup (`bkp-db-weekly`).
 - `inc_<ts>/backup.xbstream` — daily incrementals (`bkp-db-daily`), each based on the most recent prior incremental (or the full backup if none exists yet).
+- `full/lsn/`, `inc_<ts>/lsn/` — a copy of each backup's checkpoint metadata (`mariadb-backup --extra-lsndir`), which is all `--incremental-basedir` needs, so a daily doesn't have to unpack its base. Backups made before this existed lack it; for those, the base stream is unpacked into `${WorkDir}` instead.
 - `binlogs/` — binlogs captured hourly (`bkp-db-hourly`) since the full backup, used for point-in-time restore.
 - `${LocalBackupDir}/<timestamp>/files/` — the configured `BackupFolders`, backed up by `bkp-folders` (called automatically at the end of every `bkp-db-daily` run).
 
 `${LocalBackupDir}/.backup-state` tracks `lastFullTS`/`lastIncTS` so `bkp-db-daily`/`bkp-db-hourly` know which chain to append to when called with no explicit timestamp (as cron does).
+
+**Failure handling**: every step checks the previous one (the backup container's exit code is `mariadb-backup`'s, not a trailing `chown`'s; a backup with an empty stream or no LSN metadata counts as failed), and `bkp-to-cloud` returns non-zero unless the upload succeeded. `gcloud storage cp` replaces an existing object only once the upload completes, so a failed upload leaves the previous cloud copy intact. Temporary files go in `${WorkDir}` (via `make-work-dir`), falling back to `/tmp` with a warning.
 
 **Priority/locking**: weekly > daily > hourly, enforced via `flock` on `weekly.lock`/`daily.lock`/`hourly.lock` in `scriptDir`. Starting a higher-priority backup kills any lower-priority one currently running (`terminate-lower-priority`, matched via `pgrep -f` against the running script's own name). `bkp-db-daily`/`bkp-db-hourly` check `higher-priority-running` before acquiring their own lock and bail out (rather than queue) if a higher-priority run is active.
 

@@ -25,6 +25,48 @@ scriptName=$(basename "${0}")
 dbNetworkArgs=()
 [ -n "${DBDockerNetwork}" ] && dbNetworkArgs=(--network "${DBDockerNetwork}")
 
+# prints the path of a new temporary directory inside WorkDir (or /tmp, with a warning, if WorkDir isn't set)
+make-work-dir() {
+ local parentDir="${WorkDir}"
+ if [ -z "${parentDir}" ]; then
+  log-line wrn "WorkDir is not set in ${envFile} - using /tmp, which may be too small to hold unpacked backups" >&2
+  parentDir="/tmp"
+ fi
+ if ! mkdir -p "${parentDir}" || ! mktemp -d -p "${parentDir}" bkp.XXXXXXXXXX; then
+  log-line err "cannot create a temporary directory in ${parentDir}" >&2
+  return 1
+ fi
+}
+
+human-size() {
+ local bytes="${1}"
+ if [ "${bytes}" -lt 1024 ]; then
+  echo "${bytes} B"
+ else
+  numfmt --to=iec-i --suffix=B --format=%.1f "${bytes}"
+ fi
+}
+# apparent size of a file or directory, human-readable
+size-of() {
+ local bytes
+ bytes=$(du -sb "${1}" 2>/dev/null | cut -f1)
+ if [ -n "${bytes}" ]; then
+  human-size "${bytes}"
+ else
+  echo "unknown size"
+ fi
+}
+
+# logs the last lines of a failed step's captured stderr
+log-tail() {
+ local logFile="${1}"
+ [ -s "${logFile}" ] || return 0
+ local line
+ tail -n 15 "${logFile}" | while IFS= read -r line; do
+  log-line err "  ${line}"
+ done
+}
+
 acquire-lock() {
  local lockFile="${1}"
  local fd="${2}"
@@ -100,16 +142,23 @@ full-backup-stale() {
 extract-xbstream() {
  local streamFile="${1}"
  local targetDir="${2}"
- log-line msg "extracting ${streamFile} -> ${targetDir}"
+ log-line msg "extracting ${streamFile} ($(size-of "${streamFile}")) -> ${targetDir}"
  mkdir -p "${targetDir}"
- docker run --rm \
+ if ! docker run --rm \
   -v "$(dirname "${streamFile}")":/source:ro \
   -v "${targetDir}":/workdir \
-  "${DBBackupImage}" sh -c 'cd /workdir && mbstream -x < "/source/'"$(basename "${streamFile}")"'"
-                     chown -R '$(id -u)':'$(id -g)' /workdir'
+  "${DBBackupImage}" sh -c 'cd /workdir && mbstream -x < "/source/'"$(basename "${streamFile}")"'" \
+                     && chown -R '$(id -u)':'$(id -g)' /workdir'; then
+  log-line err "failed to extract ${streamFile} into ${targetDir} (out of space on that volume?)"
+  return 1
+ fi
 }
 remove-extracted() {
+ [ -n "${1}" ] || return 0
  docker run --rm -v "$(dirname "${1}")":/workdir:rw "${ALPINE_IMAGE}" rm -rf /workdir/$(basename "${1}")
+}
+has-lsn-metadata() {
+ [ -f "${1}/mariadb_backup_checkpoints" ] || [ -f "${1}/xtrabackup_checkpoints" ]
 }
 
 wait-for-db() {
@@ -129,6 +178,7 @@ wait-for-db() {
 
 db-start() {
  require-db-type
+ require-tools docker
  require-vars DBContainerName DBUser DBPassword
  log-line msg "=== STARTING DATABASE CONTAINER ==="
  if ! docker ps -a --filter "name=^/${DBContainerName}$" -q 2>/dev/null | grep -q .; then
@@ -163,9 +213,63 @@ db-start() {
 ######################################### BACKUP DATABASE #########################################
 ###################################################################################################
 
+# streams a backup into <targetDir>/backup.xbstream, and keeps a copy of its LSN metadata in <targetDir>/lsn so the
+# next incremental can be based on it without unpacking the stream; an incremental is based on <incrementalBaseDir>
+run-mariadb-backup() {
+ local containerName="${1}"
+ local targetDir="${2}"
+ local incrementalBaseDir="${3}"
+ local streamFile="${targetDir}/backup.xbstream"
+ local backupLog="${targetDir}/mariadb-backup.log"
+ local remotePassword="${DBRemotePassword:-${DBPassword}}"
+ local baseMountArgs=()
+ local incrementalArg=""
+ if [ -n "${incrementalBaseDir}" ]; then
+  baseMountArgs=(-v "${incrementalBaseDir}":/base:ro)
+  incrementalArg="--incremental-basedir=/base"
+ fi
+ mkdir -p "${targetDir}"
+ docker run --rm --name "${containerName}" \
+            --log-driver none \
+            -v "${DBDataDir}":/var/lib/mysql:ro \
+            "${baseMountArgs[@]}" \
+            -v "${targetDir}":/backup:rw \
+            "${dbNetworkArgs[@]}" \
+            "${DBBackupImage}" \
+            bash -c 'mariadb-backup --backup \
+                                    --target-dir=/backup \
+                                    --extra-lsndir=/backup/lsn \
+                                    '"${incrementalArg}"' \
+                                    --stream=xbstream \
+                                    --host="'"${DBHost}"'" \
+                                    --port="'"${DBPort}"'" \
+                                    --user="'"${DBUser}"'" \
+                                    --password="'"${remotePassword}"'" \
+                     && chown -R "'"$(id -u)":"$(id -g)"'" /backup' > "${streamFile}" 2> "${backupLog}"
+ local exitCode=${?}
+ if [ ${exitCode} -ne 0 ]; then
+  log-line err "mariadb-backup failed with code ${exitCode}:"
+  log-tail "${backupLog}"
+  return 1
+ fi
+ if [ ! -s "${streamFile}" ]; then
+  log-line err "mariadb-backup finished, but the backup stream is empty:"
+  log-tail "${backupLog}"
+  return 1
+ fi
+ if ! has-lsn-metadata "${targetDir}/lsn"; then
+  log-line err "mariadb-backup finished, but saved no LSN metadata in ${targetDir}/lsn:"
+  log-tail "${backupLog}"
+  return 1
+ fi
+ rm -f "${backupLog}"
+ log-line msg "backup file successfully created at ${streamFile} ($(size-of "${streamFile}"))"
+}
+
 bkp-db-weekly() {
  require-db-type
  require-vars DBHost DBPort DBUser DBPassword DBDataDir DBBackupImage
+ require-tools docker flock pgrep tar bzip2 openssl gcloud
  log-line msg "=== STARTING WEEKLY BACKUP ==="
  acquire-lock "${lockWeekly}" ${LOCK_FD_WEEKLY}
  terminate-lower-priority 3
@@ -173,7 +277,6 @@ bkp-db-weekly() {
  ts=$(date -u +"%Y%m%d%H%M%S")
  local bkpRoot="${LocalBackupDir}/${ts}/mariadb"
  local fullDir="${bkpRoot}/full"
- local streamFile="${fullDir}/backup.xbstream"
  local prevBkp=""
  local d
  for d in $(find "${LocalBackupDir}" -mindepth 1 -maxdepth 1 -type d -name '[0-9][0-9][0-9][0-9][0-1][0-9][0-3][0-9][0-2][0-9][0-5][0-9][0-5][0-9]' | sort -r); do
@@ -182,23 +285,7 @@ bkp-db-weekly() {
    break
   fi
  done
- local remotePassword="${DBRemotePassword:-${DBPassword}}"
- mkdir -p "${fullDir}"
- if docker run --rm --name "mariadb-backup-full-${ts}" \
-               --log-driver none \
-               -v "${DBDataDir}":/var/lib/mysql:ro \
-               -v "${fullDir}":/backup:rw \
-               "${dbNetworkArgs[@]}" \
-               "${DBBackupImage}" \
-               bash -c 'mariadb-backup --backup \
-                                       --target-dir=/backup \
-                                       --stream=xbstream \
-                                       --host="'"${DBHost}"'" \
-                                       --port="'"${DBPort}"'" \
-                                       --user="'"${DBUser}"'" \
-                                       --password="'"${remotePassword}"'"
-                        chown -R "'"$(id -u)":"$(id -g)"'" /backup' 2> /dev/null > "${streamFile}"; then
-  log-line msg "backup file successfully created at ${streamFile}"
+ if run-mariadb-backup "mariadb-backup-full-${ts}" "${fullDir}"; then
   if [[ -n "${prevBkp}" ]]; then
    release-lock "${lockWeekly}" "${LOCK_FD_WEEKLY}"
    bkp-db-daily "${prevBkp}"
@@ -219,25 +306,36 @@ bkp-db-weekly() {
   lastFullTs="${ts}"
   lastIncTs=""
   save-state
+  local result=0
   if [[ -n "${prevBkp}" ]]; then
-   bkp-to-cloud "${prevBkp}" "weekly"
-   if [ "${?}" -eq 0 ]; then
+   if bkp-to-cloud "${prevBkp}" "weekly"; then
     rm -rf "${LocalBackupDir}/${prevBkp}"
    else
-    log-line wrn "couldn't upload previous week's backups to cloud (${LocalBackupDir}/${prevBkp})"
+    log-line wrn "couldn't upload previous week's backups to cloud - keeping them locally (${LocalBackupDir}/${prevBkp})"
+    result=1
    fi
   fi
-  bkp-to-cloud "${ts}" "daily"
-  log-line msg "=== WEEKLY BACKUP COMPLETED ==="
+  if ! bkp-to-cloud "${ts}" "daily"; then
+   log-line wrn "couldn't upload the new full backup to cloud (${LocalBackupDir}/${ts})"
+   result=1
+  fi
+  if [ ${result} -eq 0 ]; then
+   log-line msg "=== WEEKLY BACKUP COMPLETED ==="
+  else
+   log-line wrn "=== WEEKLY BACKUP COMPLETED WITH ERRORS ==="
+  fi
+  return ${result}
  else
-  rm -rf "${fullDir}"
-  log-line err "weekly backup failed with code ${?}"
+  # the whole chain dir, not just full/ - an empty chain dir would be picked up as the previous week next time
+  rm -rf "${LocalBackupDir:?}/${ts}"
+  log-line err "weekly backup failed"
   return 1
  fi
 }
 bkp-db-daily() {
  require-db-type
  require-vars DBHost DBPort DBUser DBPassword DBDataDir DBBackupImage
+ require-tools docker flock pgrep tar bzip2 openssl gcloud
  if higher-priority-running "${lockWeekly}"; then
   log-line wrn "weekly backup is running - skipping daily"
   return 1
@@ -285,47 +383,50 @@ bkp-db-daily() {
   lastFullDir="${bkpRoot}/inc_${maxIncTs}"
   log-line msg "found incremental backup at ${lastFullDir}"
  fi
- local lastStream="${lastFullDir}/backup.xbstream"
- local extractDir
- extractDir=$(mktemp -d)
- extract-xbstream "${lastStream}" "${extractDir}"
- local streamFile="${incDir}/backup.xbstream"
- local remotePassword="${DBRemotePassword:-${DBPassword}}"
- mkdir -p "${incDir}"
- if docker run --rm --name "mariadb-backup-inc-${ts}" \
-               --log-driver none \
-               -v "${DBDataDir}":/var/lib/mysql:ro \
-               -v "${extractDir}":/base:ro \
-               -v "${incDir}":/backup:rw \
-               "${dbNetworkArgs[@]}" \
-               "${DBBackupImage}" \
-               bash -c 'mariadb-backup --backup \
-                                       --target-dir=/backup \
-                                       --incremental-basedir=/base \
-                                       --stream=xbstream \
-                                       --host="'"${DBHost}"'" \
-                                       --port="'"${DBPort}"'" \
-                                       --user="'"${DBUser}"'" \
-                                       --password="'"${remotePassword}"'"
-                        chown -R "'"$(id -u)":"$(id -g)"'" /backup' > "${streamFile}" 2> /dev/null; then
-  log-line msg "backup file successfully created at ${streamFile}"
+ local incBaseDir="${lastFullDir}/lsn"
+ local extractDir=""
+ if ! has-lsn-metadata "${incBaseDir}"; then
+  log-line msg "no LSN metadata saved alongside ${lastFullDir} (made by an older version of bkp) - unpacking it to read it"
+  extractDir=$(make-work-dir) || return 1
+  if ! extract-xbstream "${lastFullDir}/backup.xbstream" "${extractDir}"; then
+   remove-extracted "${extractDir}"
+   return 1
+  fi
+  incBaseDir="${extractDir}"
+  if ! has-lsn-metadata "${incBaseDir}"; then
+   log-line err "${lastFullDir}/backup.xbstream contains no LSN metadata, so it's probably a broken backup"
+   log-line err "move ${lastFullDir} out of ${bkpRoot}, so the next daily backup is based on the backup before it"
+   remove-extracted "${extractDir}"
+   return 1
+  fi
+ fi
+ if run-mariadb-backup "mariadb-backup-inc-${ts}" "${incDir}" "${incBaseDir}"; then
   remove-extracted "${extractDir}"
   lastIncTs="${ts}"
   save-state
-  if [[ -z "${1}" ]]; then
-   bkp-to-cloud "${fullTs}" "daily"
+  local result=0
+  bkp-folders "${fullTs}"
+  if [[ -z "${1}" ]] && ! bkp-to-cloud "${fullTs}" "daily"; then
+   log-line wrn "couldn't upload backup chain ${fullTs} to cloud (${LocalBackupDir}/${fullTs})"
+   result=1
   fi
-  log-line msg "=== DAILY BACKUP COMPLETED ==="
+  if [ ${result} -eq 0 ]; then
+   log-line msg "=== DAILY BACKUP COMPLETED ==="
+  else
+   log-line wrn "=== DAILY BACKUP COMPLETED WITH ERRORS ==="
+  fi
+  return ${result}
  else
-  log-line err "daily backup failed with code ${?}"
+  remove-extracted "${extractDir}"
   rm -rf "${incDir}"
+  log-line err "daily backup failed"
   return 1
  fi
- bkp-folders "${fullTs}"
 }
 bkp-db-hourly() {
  require-db-type
  require-vars DBDataDir DBBinlogBasename DBContainerName DBUser DBPassword
+ require-tools docker flock
  if higher-priority-running "${lockWeekly}" || higher-priority-running "${lockDaily}"; then
   log-line wrn "higher priority backup running - skipping hourly"
   return 1
@@ -371,10 +472,10 @@ bkp-db-hourly() {
                                                 exit 0
                                                fi
                                                for f in ${files[@]}; do
-                                                cp "${f}" /target/
+                                                cp "${f}" /target/ || exit 1
                                                done
                                                chown '$(id -u)':'$(id -g)' "/target/"*'; then
-  log-line msg "binlogs successfully copied to ${binlogDir}/"
+  log-line msg "binlogs successfully copied to ${binlogDir}/ ($(size-of "${binlogDir}") in total)"
   purge-old-binlogs
   log-line msg "=== HOURLY BACKUP COMPLETED ==="
  else
@@ -395,38 +496,61 @@ perform-restore() { # TODO: if isPITR=1, find the full backup that precedes targ
  cd "${restoreDBDir}" || { log-line err "cannot cd to ${restoreDBDir}"; return 1; }
  local baseDir="./base"
  local incDirs=($(ls -d ./_inc_* 2>/dev/null | sort))
+ local prepareLog="${restoreDBDir}/prepare.log"
  log-line msg "preparing backup chain (base = ${baseDir}, incrementals: ${#incDirs[@]}) ..."
- docker run --rm -v "${restoreDBDir}/${baseDir}":/backup:rw \
-  "${DBBackupImage}" bash -c 'mariadb-backup --prepare --target-dir=/backup
-                        chown -R "'"$(id -u)":"$(id -g)"'" /backup' 2> /dev/null
+ if ! docker run --rm -v "${restoreDBDir}/${baseDir}":/backup:rw \
+  "${DBBackupImage}" bash -c 'mariadb-backup --prepare --target-dir=/backup \
+                        && chown -R "'"$(id -u)":"$(id -g)"'" /backup' 2> "${prepareLog}"; then
+  log-line err "preparing the full backup failed - the database was left untouched:"
+  log-tail "${prepareLog}"
+  return 1
+ fi
  local inc
  for inc in "${incDirs[@]}"; do
   local incName
   incName=$(basename "${inc}")
   log-line msg "-> applying incremental ${incName}"
-  docker run --rm -v "${restoreDBDir}/${baseDir}":/base:rw -v "${restoreDBDir}/${inc}":/inc:rw \
-   "${DBBackupImage}" bash -c 'mariadb-backup --prepare --target-dir=/base --incremental-dir=/inc
-                         chown -R "'"$(id -u)":"$(id -g)"'" /base' 2> /dev/null
+  # base and incremental in one mount: mariadb-backup moves files between them, which fails across mounts
+  if ! docker run --rm -v "${restoreDBDir}":/restore:rw \
+   "${DBBackupImage}" bash -c 'mariadb-backup --prepare --target-dir="/restore/'"${baseDir}"'" --incremental-dir="/restore/'"${incName}"'" \
+                         && chown -R "'"$(id -u)":"$(id -g)"'" "/restore/'"${baseDir}"'"' 2> "${prepareLog}"; then
+   log-line err "applying incremental ${incName} failed - the database was left untouched:"
+   log-tail "${prepareLog}"
+   return 1
+  fi
  done
+ rm -f "${prepareLog}"
  local backupEndDatetime
  backupEndDatetime=$(grep '^end_time' "${baseDir}/mariadb_backup_info" | awk -F '= ' '{gsub(/"/,"",$2); print $2}' | xargs)
  log-line msg "backup chain consistent as of: ${backupEndDatetime}"
  log-line msg "stopping MariaDB container..."
  docker stop "${DBContainerName}" || true
- log-line msg "saving corrupted/current data dir -> ${DBDataDir}-corrupted-$(date -u +"%Y%m%d%H%M%S")"
- mv "${DBDataDir}" "${DBDataDir}-corrupted-$(date -u +"%Y%m%d%H%M%S")"
+ local corruptedDir="${DBDataDir}-corrupted-$(date -u +"%Y%m%d%H%M%S")"
+ log-line msg "saving corrupted/current data dir -> ${corruptedDir}"
+ if ! mv "${DBDataDir}" "${corruptedDir}"; then
+  log-line err "failed to move ${DBDataDir} aside - ${DBContainerName} is stopped, start it again with '${scriptName} db-start'"
+  return 1
+ fi
  mkdir -p "${DBDataDir}"
  log-line msg "copying back data from backup..."
- docker run --rm -v "${DBDataDir}":/var/lib/mysql:rw -v "${restoreDBDir}/${baseDir}":/backup:ro \
-  "${DBBackupImage}" mariadb-backup --copy-back --target-dir=/backup --datadir=/var/lib/mysql 2> /dev/null
+ if ! docker run --rm -v "${DBDataDir}":/var/lib/mysql:rw -v "${restoreDBDir}/${baseDir}":/backup:ro \
+  "${DBBackupImage}" mariadb-backup --copy-back --target-dir=/backup --datadir=/var/lib/mysql 2> "${prepareLog}"; then
+  log-line err "copying back the backup into ${DBDataDir} failed - ${DBContainerName} was left stopped:"
+  log-tail "${prepareLog}"
+  log-line err "the previous data dir is at ${corruptedDir} - move it back to ${DBDataDir} to undo"
+  return 1
+ fi
+ rm -f "${prepareLog}"
  log-line msg "starting MariaDB container..."
  docker start "${DBContainerName}"
  wait-for-db "${DBContainerName}" "${DBUser}" "${DBPassword}"
  if [ "${isPITR}" = "1" ] && [[ "${backupEndDatetime}" < "${targetDatetimeStr}" ]]; then
   log-line msg "applying binary logs from ${backupEndDatetime} -> ${targetDatetimeStr}..."
   local pitrDir
-  pitrDir=$(mktemp -d)
-  mkdir -p "${pitrDir}"
+  if ! pitrDir=$(make-work-dir); then
+   log-line err "binary logs not applied - the database is restored to ${backupEndDatetime}"
+   return 1
+  fi
   cp "${LocalBackupDir}/${ts}/mariadb/binlogs/"* "${pitrDir}"
   if [ "${?}" -ne 0 ]; then
    log-line msg "failed to copy binary logs to PITR folder"
@@ -479,6 +603,7 @@ perform-restore() { # TODO: if isPITR=1, find the full backup that precedes targ
 restore-db-local() {
  require-db-type
  require-vars DBDataDir DBContainerName DBPassword DBBackupImage DBBinlogBasename
+ require-tools docker
  local ts="${1}"
  local targetDatetimeStr="${2}"
  if [ -z "${ts}" ]; then
@@ -519,18 +644,27 @@ restore-db-local() {
  done
  log-line msg "selected ${#selectedIncDirs[@]} incremental backup(s)"
  local fullStream="${selectedFullDir}/backup.xbstream"
- extract-xbstream "${fullStream}" "${restoreDBDir}/base"
+ if ! extract-xbstream "${fullStream}" "${restoreDBDir}/base"; then
+  remove-extracted "${restoreDBDir}"
+  return 1
+ fi
  local i
  for ((i=0; i<${#selectedIncDirs[@]}; i++)); do
   local incStream="${selectedIncDirs[i]}/backup.xbstream"
-  extract-xbstream "${incStream}" "${restoreDBDir}/_inc_${i}"
+  if ! extract-xbstream "${incStream}" "${restoreDBDir}/_inc_${i}"; then
+   remove-extracted "${restoreDBDir}"
+   return 1
+  fi
  done
+ local result=0
  perform-restore "${isPITR}" "${targetDatetimeStr}" "${ts}"
  if [ "${?}" -ne 0 ]; then
   log-line err "there's been an error restoring the database"
   log-line err "fix the errors, then re-run restore with ${scriptName} restore-db-local \"${ts}\" \"${targetDatetimeStr}\""
+  result=1
  fi
  rm -rf "${restoreDBDir}"
+ return ${result}
 }
 
 ###################################################################################################
@@ -588,38 +722,50 @@ restore-folders-local() {
 bkp-to-cloud() {
  require-cloud-provider
  require-vars GCSBucket AESPassphrase BackupInstanceName
+ require-tools tar bzip2 openssl gcloud
  local ts="${1}"
  local level="${2}"
  if [ -z "${ts}" ] || [ -z "${level}" ]; then
   log-line err "usage: ${scriptName} bkp-to-cloud <timestamp> <weekly|daily>"
   return 1
  fi
- local archiveName="${level}-backup.${BackupInstanceName}.${ts}.tar.bz2"
- local archivePath="/tmp/${archiveName}"
- local encryptedPath="${archivePath}.aes256"
- tar -cvjf "${archivePath}" -C "${LocalBackupDir}/${ts}" . 2>/dev/null 2>&1
- export PASSPHRASE="${AESPassphrase}"
- openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -in "${archivePath}" -out "${encryptedPath}" -pass env:PASSPHRASE
- local cloudPath="gs://${GCSBucket}/${archiveName}.aes256"
- if gcloud storage ls "${cloudPath}" >/dev/null 2>&1; then
-  gcloud storage rm "${cloudPath}" 2>/dev/null || true
+ local srcDir="${LocalBackupDir}/${ts}"
+ if [ ! -d "${srcDir}" ]; then
+  log-line err "no local backup found at ${srcDir}"
+  return 1
  fi
- gcloud storage cp "${encryptedPath}" "${cloudPath}"
- if [ "${?}" -eq 0 ]; then
-  if [ "${level}" = "weekly" ]; then
-   gcloud storage rm -q "gs://${GCSBucket}/daily-backup.${BackupInstanceName}.*.tar.bz2.aes256" 2>/dev/null || true
-  fi
-  rm -f "${encryptedPath}"
- else
-  log-line wrn "failed to upload encrypted archive to cloud, moving to restore directory"
+ local archiveName="${level}-backup.${BackupInstanceName}.${ts}.tar.bz2.aes256"
+ local workDir
+ workDir=$(make-work-dir) || return 1
+ local encryptedPath="${workDir}/${archiveName}"
+ local cloudPath="gs://${GCSBucket}/${archiveName}"
+ log-line msg "archiving and encrypting ${srcDir} ($(size-of "${srcDir}")) -> ${encryptedPath}"
+ export PASSPHRASE="${AESPassphrase}"
+ if ! (set -o pipefail
+       tar -cjf - -C "${srcDir}" . | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -out "${encryptedPath}" -pass env:PASSPHRASE); then
+  log-line err "failed to archive and encrypt ${srcDir} (out of space in ${workDir}?) - nothing was uploaded"
+  rm -rf "${workDir}"
+  return 1
+ fi
+ log-line msg "encrypted archive created ($(size-of "${encryptedPath}")), uploading to ${cloudPath}"
+ # an existing object is only replaced once the new upload completes, so a failed upload leaves it intact
+ if ! gcloud storage cp "${encryptedPath}" "${cloudPath}"; then
+  log-line err "failed to upload encrypted archive to cloud, moving it to ${RestoreDir}"
   mkdir -p "${RestoreDir}"
   mv "${encryptedPath}" "${RestoreDir}"
+  rm -rf "${workDir}"
+  return 1
  fi
- rm -f "${archivePath}"
+ log-line msg "uploaded ${cloudPath} ($(size-of "${encryptedPath}"))"
+ rm -rf "${workDir}"
+ if [ "${level}" = "weekly" ]; then
+  gcloud storage rm -q "gs://${GCSBucket}/daily-backup.${BackupInstanceName}.*.tar.bz2.aes256" 2>/dev/null || true
+ fi
 }
 restore-from-cloud() {
  require-cloud-provider
  require-vars GCSBucket AESPassphrase BackupInstanceName
+ require-tools gcloud openssl tar bzip2 docker
  local targetDatetime="${1}"
  local ts
  ts=$(date -u +"%Y%m%d%H%M%S")
@@ -725,6 +871,7 @@ restore-from-cloud() {
 ###################################################################################################
 
 install-cron() {
+ require-tools crontab
  mkdir -p "$(dirname "${LogFile}")"
  local exe="${scriptDir}/bkp"
  local weeklyLine="${CronWeekly} ${exe} bkp-db-weekly >> ${LogFile} 2>&1"
@@ -786,9 +933,27 @@ purge-old-binlogs() {
  fi
 }
 
+status-tools() {
+ echo "${BOLD}${CYAN}Required tools${RESET}"
+ local missing tool
+ missing=$(missing-tools "${KNOWN_TOOLS[@]}")
+ if [ -z "${missing}" ]; then
+  echo "  all found"
+ fi
+ for tool in ${missing}; do
+  echo "  ${RED}${tool} not found${RESET} - $(tool-install-hint "${tool}")"
+ done
+ echo
+}
+
 status-db() {
  echo "${BOLD}${CYAN}Database${RESET}"
  dbUp=false
+ if ! command -v docker >/dev/null 2>&1; then
+  echo "  container ${DBContainerName}: ${RED}cannot check${RESET} (docker not found)"
+  echo
+  return
+ fi
  if [ -n "${DBContainerName}" ] && docker ps --filter "name=^/${DBContainerName}$" --filter "status=running" -q 2>/dev/null | grep -q .; then
   if docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SELECT 1" >/dev/null 2>&1; then
    dbUp=true
@@ -805,6 +970,11 @@ status-db() {
 
 status-schedule() {
  echo "${BOLD}${CYAN}Backup schedule (cron)${RESET}"
+ if ! command -v crontab >/dev/null 2>&1; then
+  echo "  ${RED}cannot check${RESET} (crontab not found)"
+  echo
+  return
+ fi
  local exe="${scriptDir}/bkp"
  local cronList
  cronList=$(crontab -l 2>/dev/null)
@@ -827,19 +997,35 @@ status-schedule() {
  echo
 }
 
+# size of a backup stream file, flagging a missing or empty one
+stream-size() {
+ if [ ! -f "${1}" ]; then
+  echo "${RED}missing${RESET} (${1})"
+ elif [ ! -s "${1}" ]; then
+  echo "${RED}EMPTY${RESET} - this backup is broken"
+ else
+  size-of "${1}"
+ fi
+}
+
 status-local-backups() {
  echo "${BOLD}${CYAN}Local backups${RESET}"
  load-state
+ local chainDir="${LocalBackupDir}/${lastFullTs}"
  if [ -n "${lastFullTs}" ]; then
-  echo "  last full backup:        ${lastFullTs} ($(format-backup-ts "${lastFullTs}"))"
+  echo "  last full backup:        ${lastFullTs} ($(format-backup-ts "${lastFullTs}")), $(stream-size "${chainDir}/mariadb/full/backup.xbstream")"
  else
   echo "  last full backup:        none"
  fi
  if [ -n "${lastIncTs}" ]; then
-  echo "  last incremental backup: ${lastIncTs} ($(format-backup-ts "${lastIncTs}"))"
+  echo "  last incremental backup: ${lastIncTs} ($(format-backup-ts "${lastIncTs}")), $(stream-size "${chainDir}/mariadb/inc_${lastIncTs}/backup.xbstream")"
  else
   echo "  last incremental backup: none"
  fi
+ if [ -n "${lastFullTs}" ] && [ -d "${chainDir}" ]; then
+  echo "  current chain total:     $(size-of "${chainDir}") (full + incrementals + binlogs + folders)"
+ fi
+ echo "  all local backups:       $(size-of "${LocalBackupDir}") in ${LocalBackupDir}"
  echo
 }
 
@@ -896,18 +1082,24 @@ status-cloud-backups() {
  fi
  # each --long line is "<size> <creation time> <url>"; the object name's timestamp is the chain's full backup,
  # not the upload time (daily uploads re-archive the whole chain under its full backup's timestamp)
- local latestFile="" latestCreated="" latestTs=""
+ local latestFile="" latestCreated="" latestSize="" latestTs=""
  local size created url
  while read -r size created url; do
   if [[ "${created}" > "${latestCreated}" ]]; then
    latestCreated="${created}"
    latestFile="${url}"
+   latestSize="${size}"
   fi
  done <<< "${candidates}"
  latestTs=$(basename "${latestFile}" | grep -oE '[0-9]{14}')
  local level
  level=$(basename "${latestFile}" | cut -d'-' -f1)
  echo "  last upload: ${level} backup, uploaded $(date -u -d "${latestCreated}" +"%Y-%m-%d %H:%M:%S UTC" 2>/dev/null || echo "${latestCreated}")"
+ if [ "${latestSize}" -lt 1024 ] 2>/dev/null; then
+  echo "  size:        ${RED}$(human-size "${latestSize}")${RESET} - suspiciously small, probably a broken upload"
+ else
+  echo "  size:        $(human-size "${latestSize}")"
+ fi
  echo "  chain:       full backup ${latestTs} ($(format-backup-ts "${latestTs}"))"
  echo "  object:      ${latestFile}"
  echo
@@ -915,6 +1107,11 @@ status-cloud-backups() {
 
 status-replication() {
  echo "${BOLD}${CYAN}Replication${RESET}"
+ if ! command -v docker >/dev/null 2>&1; then
+  echo "  cannot check (docker not found)"
+  echo
+  return
+ fi
  if [ "${dbUp}" != true ]; then
   echo "  cannot check (database is down)"
   echo
@@ -1014,6 +1211,7 @@ limit-output() {
 
 restart-replication() {
  require-db-type
+ require-tools docker
  require-vars DBContainerName DBUser DBPassword
  if ! docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SELECT 1" >/dev/null 2>&1; then
   log-line err "database is not up - run '${scriptName} db-start' first"
@@ -1085,6 +1283,7 @@ read-restored-binlog-pos() {
 
 start-replica() {
  require-db-type
+ require-tools docker
  require-vars DBContainerName DBUser DBPassword DBMasterHost DBMasterPort DBMasterUser DBMasterPassword
  local masterLogFile="${1}"
  local masterLogPos="${2}"
@@ -1141,6 +1340,7 @@ status() {
  {
   echo "${BOLD}=== bkp status (${BackupInstanceName}) ===${RESET}"
   echo
+  status-tools
   status-db
   status-schedule
   status-local-backups

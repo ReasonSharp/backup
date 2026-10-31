@@ -63,6 +63,8 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
 
   ${BOLD}bkp-to-cloud${RESET} <timestamp> <weekly|daily>
    - archives everything in ${BOLD}\${LocalBackupDir}/<timestamp>${RESET} to a bzip2 archive, encrypts it with ${BOLD}aes-256-cbc${RESET} using ${BOLD}AESPassphrase${RESET}, and uploads it to ${BOLD}gs://\${GCSBucket}/${RESET}
+   - the encrypted archive is built in ${BOLD}\${WorkDir}${RESET} (or ${BOLD}/tmp${RESET} if ${BOLD}WorkDir${RESET} isn't set)
+   - an existing cloud object with the same name is only replaced once the new upload succeeds
    - if upload to cloud fails, moves the encrypted archive to ${BOLD}\${RestoreDir}${RESET}
 
   ${BOLD}restore-db-local${RESET} <timestamp> [target-datetime]
@@ -81,8 +83,9 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
    - backup to cloud runs automatically after each weekly and daily backup
 
   ${BOLD}status${RESET}
+   - shows which required tools (docker, gcloud, bzip2, ...) are missing, if any, and prints whatever it can check without them
    - shows whether the configured database is reachable, whether the backup cron schedule is installed
-   - shows the timestamp of the last local backup and the last backup uploaded to cloud
+   - shows the timestamp and size of the last local backups and the last backup uploaded to cloud (with its upload time)
    - if the database is a replica, shows replication status (log files, positions, seconds behind master, last error)
    - shows free space on the volumes holding ${BOLD}\${DBDataDir}${RESET} and ${BOLD}\${LocalBackupDir}${RESET}
 
@@ -112,6 +115,14 @@ export scriptDir
 envFile="${scriptDir}/.env"
 envTemplate="${scriptDir}/.env.template"
 
+cmd="${1}"
+shift
+
+. "${scriptDir}/lib/common.sh"
+
+# status reports missing tools itself, in its own section
+[ "${cmd}" != "status" ] && warn-missing-tools
+
 if [ -f "${envFile}" ]; then
  set -a
  . "${envFile}"
@@ -137,15 +148,14 @@ set -a
 export DBType DBPort DBContainerName DBMasterPort DBBackupImage LocalBackupDir RestoreDir CloudProvider BackupInstanceName CronWeekly CronDaily CronHourly LogFile
 [ -f "${envFile}" ] && . "${envFile}"
 set +a
-envsubst < "${envTemplate}" > "${envFile}"
+# without envsubst the redirect alone would truncate .env, losing its values
+if command -v envsubst >/dev/null 2>&1; then
+ envsubst < "${envTemplate}" > "${envFile}"
+fi
 
 mkdir -p "${LocalBackupDir}" "${RestoreDir}" "$(dirname "${LogFile}")"
 
-. "${scriptDir}/lib/common.sh"
 . "${scriptDir}/lib/backup.sh"
-
-cmd="${1}"
-shift
 
 case "${cmd}" in
  bkp-db-weekly)         bkp-db-weekly;;
