@@ -866,7 +866,7 @@ status-cloud-backups() {
  # output goes to a file rather than $(...), so stray gcloud subprocesses holding the pipe open can't outlive the timeout
  local lsOutput lsExit lsOutputFile
  lsOutputFile=$(mktemp)
- timeout -k 1 "${STATUS_CLOUD_TIMEOUT_SECONDS}" gcloud storage ls "gs://${GCSBucket}/*-backup.${BackupInstanceName}.*.tar.bz2.aes256" >"${lsOutputFile}" 2>&1
+ timeout -k 1 "${STATUS_CLOUD_TIMEOUT_SECONDS}" gcloud storage ls --long "gs://${GCSBucket}/*-backup.${BackupInstanceName}.*.tar.bz2.aes256" >"${lsOutputFile}" 2>&1
  lsExit=${?}
  lsOutput=$(cat "${lsOutputFile}")
  rm -f "${lsOutputFile}"
@@ -878,7 +878,7 @@ status-cloud-backups() {
  if [ ${lsExit} -ne 0 ] && ! grep -qi "matched no objects" <<< "${lsOutput}"; then
   local lsError
   lsError=$(grep -m1 "ERROR" <<< "${lsOutput}")
-  if grep -qiE "active account|gcloud auth login|reauthenticat|credentials" <<< "${lsOutput}"; then
+  if grep -qiE "do not currently have an active account|gcloud auth login|reauthenticat|invalid_grant" <<< "${lsOutput}"; then
    echo "  ${RED}gcloud is not authenticated${RESET} (account ${activeAccount}) - run 'gcloud auth login' to refresh credentials"
   else
    echo "  ${RED}unable to list gs://${GCSBucket}/${RESET} - check your internet/network connection and bucket access"
@@ -894,20 +894,21 @@ status-cloud-backups() {
   echo
   return
  fi
- local latestFile="" latestTs="00000000000000"
- local line
- while IFS= read -r line; do
-  local filename fileTs
-  filename=$(basename "${line}")
-  fileTs=$(echo "${filename}" | grep -oE '[0-9]{14}' || echo "00000000000000")
-  if [[ "${fileTs}" > "${latestTs}" ]]; then
-   latestTs="${fileTs}"
-   latestFile="${line}"
+ # each --long line is "<size> <creation time> <url>"; the object name's timestamp is the chain's full backup,
+ # not the upload time (daily uploads re-archive the whole chain under its full backup's timestamp)
+ local latestFile="" latestCreated="" latestTs=""
+ local size created url
+ while read -r size created url; do
+  if [[ "${created}" > "${latestCreated}" ]]; then
+   latestCreated="${created}"
+   latestFile="${url}"
   fi
  done <<< "${candidates}"
+ latestTs=$(basename "${latestFile}" | grep -oE '[0-9]{14}')
  local level
  level=$(basename "${latestFile}" | cut -d'-' -f1)
- echo "  last upload: ${level} backup, ${latestTs} ($(format-backup-ts "${latestTs}"))"
+ echo "  last upload: ${level} backup, uploaded $(date -u -d "${latestCreated}" +"%Y-%m-%d %H:%M:%S UTC" 2>/dev/null || echo "${latestCreated}")"
+ echo "  chain:       full backup ${latestTs} ($(format-backup-ts "${latestTs}"))"
  echo "  object:      ${latestFile}"
  echo
 }
