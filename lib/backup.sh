@@ -1626,13 +1626,12 @@ purge-old-binlogs() {
  fi
 }
 
+# shown only if a tool is missing
 status-tools() {
- echo "${BOLD}${CYAN}Required tools${RESET}"
  local missing tool
  missing=$(missing-tools "${KNOWN_TOOLS[@]}")
- if [ -z "${missing}" ]; then
-  echo "  all found"
- fi
+ [ -n "${missing}" ] || return 0
+ echo "${BOLD}${CYAN}Required tools${RESET}"
  for tool in ${missing}; do
   echo "  ${RED}${tool} not found${RESET} - $(tool-install-hint "${tool}")"
  done
