@@ -28,6 +28,11 @@ STATUS_CLOUD_TIMEOUT_SECONDS=5
 ZSTD_LEVEL=3
 CLOUD_MANIFEST_NAME=".cloud-manifest"
 CLOUD_PIECE_SUFFIX=".tar.zst.aes256"
+UPLOAD_PROGRESS_NAME="upload.progress"
+DOWNLOAD_PROGRESS_NAME="download.progress"
+PROGRESS_LOG_INTERVAL_SECONDS=300
+PROGRESS_TTY_INTERVAL_SECONDS=30
+PROGRESS_STALLED_SECONDS=60
 
 scriptName=$(basename "${0}")
 
@@ -740,7 +745,7 @@ read-datadir-file() {
 }
 
 # prints the value of <key> in the "key=value" lines of <content>
-datadir-file-value() {
+value-of-key() {
  sed -n "s/^${2}=//p" <<< "${1}" | head -1
 }
 
@@ -1095,6 +1100,214 @@ record-uploaded-piece() {
 cloud-chain-url() {
  echo "gs://${GCSBucket}/${BackupInstanceName}/${1}"
 }
+
+# a cloud transfer (upload or download) keeps its progress in ${scriptDir}/<progress file> as key=value lines, rewritten
+# at the start of each piece, while dd counts the bytes of the current piece that went through the pipeline so far
+# into <progress file>.bytes; the file stays behind if the transfer is killed, which status reports
+
+# writes <key=value>... to <progress file>
+write-progress() {
+ local progressFile="${1}"
+ shift
+ printf "%s\n" "${@}" > "${progressFile}.new" && mv "${progressFile}.new" "${progressFile}"
+}
+
+# a pipeline stage that passes its input through, counting the bytes into <counter file> about once a second
+count-bytes() {
+ LC_ALL=C dd bs=1M status=progress 2> "${1}"
+}
+
+counted-bytes() {
+ local bytes
+ bytes=$(tr '\r' '\n' < "${1}" 2>/dev/null | sed -nE 's/^([0-9]+) bytes.*/\1/p' | tail -1)
+ echo "${bytes:-0}"
+}
+
+format-duration() {
+ local seconds="${1}"
+ if [ "${seconds}" -ge 3600 ]; then
+  echo "$((seconds / 3600))h$((seconds % 3600 / 60))m"
+ elif [ "${seconds}" -ge 60 ]; then
+  echo "$((seconds / 60))m$((seconds % 60))s"
+ else
+  echo "${seconds}s"
+ fi
+}
+
+# <part> of <whole>, as a percentage
+percent-of() {
+ if [ "${2}" -gt 0 ]; then
+  echo "$(( ${1} * 100 / ${2} ))%"
+ else
+  echo "100%"
+ fi
+}
+
+# prints "<direction> <chain> <piece number> <pieces> <piece> <piece bytes done> <piece bytes> <bytes done>
+# <total bytes> <bytes per second> <seconds left, -1 if unknown> <failed pieces> <time of the last progress, epoch>
+# <pid>" for the transfer in <progress file>, or fails if there's none
+transfer-progress() {
+ local progressFile="${1}"
+ local progress
+ progress=$(cat "${progressFile}" 2>/dev/null)
+ [ -n "${progress}" ] || return 1
+ local pieceBytes doneBytes totalBytes started
+ pieceBytes=$(value-of-key "${progress}" piece_bytes)
+ doneBytes=$(value-of-key "${progress}" done_bytes)
+ totalBytes=$(value-of-key "${progress}" total_bytes)
+ started=$(value-of-key "${progress}" started)
+ local pieceDone
+ pieceDone=$(counted-bytes "${progressFile}.bytes")
+ # an upload is measured against the size of the piece's files, and its encrypted stream can be a bit larger (or, for
+ # compressible files, much smaller)
+ [ "${pieceDone}" -gt "${pieceBytes}" ] && pieceDone="${pieceBytes}"
+ local bytesDone=$((doneBytes + pieceDone))
+ local lastProgress
+ lastProgress=$(stat -c %Y "${progressFile}.bytes" 2>/dev/null || stat -c %Y "${progressFile}")
+ local elapsed=$((lastProgress - started))
+ [ ${elapsed} -lt 1 ] && elapsed=1
+ local rate=$((bytesDone / elapsed))
+ local secondsLeft=-1
+ [ ${rate} -gt 0 ] && secondsLeft=$(((totalBytes - bytesDone) / rate))
+ echo "$(value-of-key "${progress}" direction) $(value-of-key "${progress}" chain)" \
+      "$(value-of-key "${progress}" piece_number) $(value-of-key "${progress}" pieces) $(value-of-key "${progress}" piece)" \
+      "${pieceDone} ${pieceBytes} ${bytesDone} ${totalBytes} ${rate} ${secondsLeft}" \
+      "$(value-of-key "${progress}" failed) ${lastProgress} $(value-of-key "${progress}" pid)"
+}
+
+# whether the bkp process <pid> is still running
+bkp-running() {
+ [ -n "${1}" ] && tr '\0' ' ' 2>/dev/null < "/proc/${1}/cmdline" | grep -qF "${scriptName}"
+}
+
+# a one-line summary of the transfer in <progress file>, for the log
+progress-log-line() {
+ local fields
+ fields=$(transfer-progress "${1}") || return 1
+ local direction chain pieceNumber pieces piece pieceDone pieceBytes bytesDone totalBytes rate secondsLeft failed lastProgress pid
+ read -r direction chain pieceNumber pieces piece pieceDone pieceBytes bytesDone totalBytes rate secondsLeft failed lastProgress pid <<< "${fields}"
+ local line="${direction} progress: piece ${pieceNumber} of ${pieces} (${piece}) $(human-size "${pieceDone}") of $(human-size "${pieceBytes}")"
+ line+=" ($(percent-of "${pieceDone}" "${pieceBytes}")), total $(human-size "${bytesDone}") of $(human-size "${totalBytes}")"
+ line+=" ($(percent-of "${bytesDone}" "${totalBytes}")), $(human-size "${rate}")/s"
+ local idle=$(($(date +%s) - lastProgress))
+ if [ ${idle} -ge ${PROGRESS_STALLED_SECONDS} ]; then
+  line+=" - no progress for $(format-duration "${idle}")"
+ elif [ "${secondsLeft}" -ge 0 ]; then
+  line+=", about $(format-duration "${secondsLeft}") left"
+ fi
+ echo "${line}"
+}
+
+# logs the progress of the transfer in <progress file> every PROGRESS_LOG_INTERVAL_SECONDS (more often on a terminal),
+# in the background, until stop-progress-monitor; stops by itself if bkp is gone
+start-progress-monitor() {
+ local progressFile="${1}"
+ local interval=${PROGRESS_LOG_INTERVAL_SECONDS}
+ [ -t 1 ] && interval=${PROGRESS_TTY_INTERVAL_SECONDS}
+ local bkpPid=$$
+ (
+  waited=0
+  while sleep 5 && [ -d "/proc/${bkpPid}" ]; do
+   waited=$((waited + 5))
+   if [ ${waited} -ge ${interval} ]; then
+    waited=0
+    progress-log-line "${progressFile}" | while IFS= read -r line; do log-line msg "${line}"; done
+   fi
+  done
+ ) &
+ progressMonitorPid=$!
+}
+
+stop-progress-monitor() {
+ [ -n "${progressMonitorPid}" ] || return 0
+ kill "${progressMonitorPid}" 2>/dev/null
+ wait "${progressMonitorPid}" 2>/dev/null
+ progressMonitorPid=""
+}
+
+# prints the progress of the transfer in <progress file> for status, or fails if there's none
+show-transfer-progress() {
+ local fields
+ fields=$(transfer-progress "${1}") || return 1
+ local direction chain pieceNumber pieces piece pieceDone pieceBytes bytesDone totalBytes rate secondsLeft failed lastProgress pid
+ read -r direction chain pieceNumber pieces piece pieceDone pieceBytes bytesDone totalBytes rate secondsLeft failed lastProgress pid <<< "${fields}"
+ if ! bkp-running "${pid}"; then
+  echo "  no ${direction} running - the last one, of chain ${chain}, was ${RED}interrupted${RESET}"
+  echo "    in piece ${pieceNumber} of ${pieces}, after $(human-size "${bytesDone}") of $(human-size "${totalBytes}") ($(percent-of "${bytesDone}" "${totalBytes}"))," \
+       "last progress at $(date -u -d "@${lastProgress}" +"%Y-%m-%d %H:%M:%S") UTC"
+  if [ "${direction}" = "upload" ]; then
+   echo "    -> the pieces it didn't upload are uploaded by the next daily or weekly backup, or run '${scriptName} bkp-to-cloud ${chain}'"
+  fi
+  return 0
+ fi
+ echo "  ${direction}ing chain ${chain}, piece ${pieceNumber} of ${pieces}: ${piece}"
+ echo "  piece: $(human-size "${pieceDone}") of $(human-size "${pieceBytes}") ($(percent-of "${pieceDone}" "${pieceBytes}"))"
+ local line="  total: $(human-size "${bytesDone}") of $(human-size "${totalBytes}") ($(percent-of "${bytesDone}" "${totalBytes}")), $(human-size "${rate}")/s"
+ local idle=$(($(date +%s) - lastProgress))
+ [ ${idle} -lt ${PROGRESS_STALLED_SECONDS} ] && [ "${secondsLeft}" -ge 0 ] && line+=", about $(format-duration "${secondsLeft}") left"
+ echo "${line}"
+ [ "${failed}" -gt 0 ] && echo "  ${RED}${failed} piece(s) failed${RESET} so far - they'll be retried on the next upload"
+ if [ ${idle} -ge ${PROGRESS_STALLED_SECONDS} ]; then
+  echo "  ${YELLOW}no progress for $(format-duration "${idle}")${RESET} - check the internet/network connection"
+ fi
+}
+
+status-cloud-upload() {
+ echo "${BOLD}${CYAN}Cloud upload${RESET}"
+ show-transfer-progress "${scriptDir}/${UPLOAD_PROGRESS_NAME}" || echo "  no upload running"
+ show-transfer-progress "${scriptDir}/${DOWNLOAD_PROGRESS_NAME}"
+ echo
+}
+
+upload-status() {
+ status-cloud-upload | limit-output "${STATUS_MAX_LINES}" "${STATUS_MAX_COLUMNS}"
+}
+
+# downloads, decrypts and unpacks "<object URL> <size>"... of chain <chain> into RestoreDir; <decompress> is the
+# command that decompresses them (zstd, or bzip2 for archives uploaded by older bkp versions)
+download-objects() {
+ local chain="${1}"
+ local decompress="${2}"
+ shift 2
+ local urls=() sizes=()
+ local totalBytes=0
+ while [ ${#} -ge 2 ]; do
+  urls+=("${1}")
+  sizes+=("${2}")
+  totalBytes=$((totalBytes + ${2}))
+  shift 2
+ done
+ log-line msg "downloading ${#urls[@]} piece(s) of backup chain ${chain} ($(human-size "${totalBytes}"))"
+ local progressFile="${scriptDir}/${DOWNLOAD_PROGRESS_NAME}"
+ local started
+ started=$(date +%s)
+ local doneBytes=0 result=0 i piece
+ start-progress-monitor "${progressFile}"
+ for ((i=0; i<${#urls[@]}; i++)); do
+  piece="${urls[i]#*/${chain}/}"
+  piece="${piece%"${CLOUD_PIECE_SUFFIX}"}"
+  [ "${piece}" = "${urls[i]}" ] && piece=$(basename "${urls[i]}")
+  write-progress "${progressFile}" direction=download "chain=${chain}" "pid=$$" "started=${started}" \
+   "total_bytes=${totalBytes}" "done_bytes=${doneBytes}" "pieces=${#urls[@]}" "piece_number=$((i + 1))" \
+   "piece=${piece}" "piece_bytes=${sizes[i]}" failed=0
+  : > "${progressFile}.bytes"
+  log-line msg "downloading ${urls[i]} ($(human-size "${sizes[i]}"))"
+  if ! (set -o pipefail
+        gcloud storage cat "${urls[i]}" \
+         | count-bytes "${progressFile}.bytes" \
+         | openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -pass env:PASSPHRASE \
+         | "${decompress}" -dcq \
+         | tar -xf - -C "${RestoreDir}"); then
+   log-line err "failed to download, decrypt or extract ${urls[i]} (incorrect passphrase?)"
+   result=1
+   break
+  fi
+  doneBytes=$((doneBytes + sizes[i]))
+ done
+ stop-progress-monitor
+ rm -f "${progressFile}" "${progressFile}.bytes"
+ return ${result}
+}
 # a piece needs uploading if it changed since its last upload, or its object isn't in <cloud object URLs>
 piece-needs-upload() {
  local chainDir="${1}"
@@ -1105,10 +1318,13 @@ piece-needs-upload() {
   || ! grep -qxF "${objectURL}" <<< "${cloudObjects}"
 }
 
+# uploads <piece> of <chain dir>, counting the bytes handed to gcloud into <progress file>.bytes: counted any earlier,
+# they'd run ahead of the upload by what zstd reads ahead
 upload-piece() {
  local chainDir="${1}"
  local piece="${2}"
  local objectURL="${3}"
+ local progressFile="${4}"
  local partialURL="${objectURL}.partial"
  log-line msg "uploading ${piece} ($(size-of "${chainDir}/${piece}")) -> ${objectURL}"
  export PASSPHRASE="${AESPassphrase}"
@@ -1117,6 +1333,7 @@ upload-piece() {
        tar -cf - -C "${chainDir}" "${piece}" \
         | zstd -T0 -"${ZSTD_LEVEL}" -q -c \
         | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -pass env:PASSPHRASE \
+        | count-bytes "${progressFile}.bytes" \
         | gcloud storage cp - "${partialURL}"); then
   log-line err "failed to upload ${piece}"
   gcloud storage rm "${partialURL}" >/dev/null 2>&1
@@ -1158,19 +1375,41 @@ bkp-to-cloud() {
  cloudObjects=$(gcloud storage ls "${chainURL}/**" 2>/dev/null)
  local pieces=()
  mapfile -t pieces < <(list-chain-pieces "${chainDir}")
- local piece objectURL fingerprint
- local uploaded=0 failed=0
+ local piece bytes
+ local toUpload=() sizes=()
+ local totalBytes=0
  for piece in "${pieces[@]}"; do
+  piece-needs-upload "${chainDir}" "${piece}" "${chainURL}/${piece}${CLOUD_PIECE_SUFFIX}" "${cloudObjects}" || continue
+  bytes=$(du -sb "${chainDir}/${piece}" 2>/dev/null | cut -f1)
+  toUpload+=("${piece}")
+  sizes+=("${bytes:-0}")
+  totalBytes=$((totalBytes + ${bytes:-0}))
+ done
+ [ ${#toUpload[@]} -gt 0 ] && log-line msg "uploading ${#toUpload[@]} piece(s) of backup chain ${ts} ($(human-size "${totalBytes}"))"
+ local progressFile="${scriptDir}/${UPLOAD_PROGRESS_NAME}"
+ local started
+ started=$(date +%s)
+ local objectURL fingerprint i
+ local uploaded=0 failed=0 doneBytes=0
+ start-progress-monitor "${progressFile}"
+ for ((i=0; i<${#toUpload[@]}; i++)); do
+  piece="${toUpload[i]}"
   objectURL="${chainURL}/${piece}${CLOUD_PIECE_SUFFIX}"
-  piece-needs-upload "${chainDir}" "${piece}" "${objectURL}" "${cloudObjects}" || continue
+  write-progress "${progressFile}" direction=upload "chain=${ts}" "pid=$$" "started=${started}" \
+   "total_bytes=${totalBytes}" "done_bytes=${doneBytes}" "pieces=${#toUpload[@]}" "piece_number=$((i + 1))" \
+   "piece=${piece}" "piece_bytes=${sizes[i]}" "failed=${failed}"
+  : > "${progressFile}.bytes"
   fingerprint=$(piece-fingerprint "${chainDir}" "${piece}")
-  if upload-piece "${chainDir}" "${piece}" "${objectURL}"; then
+  if upload-piece "${chainDir}" "${piece}" "${objectURL}" "${progressFile}"; then
    record-uploaded-piece "${chainDir}" "${piece}" "${fingerprint}"
    uploaded=$((uploaded + 1))
   else
    failed=$((failed + 1))
   fi
+  doneBytes=$((doneBytes + sizes[i]))
  done
+ stop-progress-monitor
+ rm -f "${progressFile}" "${progressFile}.bytes"
  eval 'exec '${LOCK_FD_CLOUD}'>&-'
  if [ ${failed} -gt 0 ]; then
   log-line err "${failed} piece(s) of backup chain ${ts} failed to upload - they'll be retried on the next upload"
@@ -1233,21 +1472,15 @@ restore-from-cloud() {
   latestTs="${chainTs}"
   local chainURL
   chainURL=$(cloud-chain-url "${chainTs}")
+  # "<size> <url>" of each piece; skips the summary line and unfinished (.partial) uploads
   local objects=()
-  mapfile -t objects < <(gcloud storage ls "${chainURL}/**" 2>/dev/null | grep -F "${CLOUD_PIECE_SUFFIX}" | grep -vE '\.partial$')
-  log-line msg "downloading backup chain ${chainTs} (${#objects[@]} piece(s)) from ${chainURL}/"
-  local object
-  for object in "${objects[@]}"; do
-   log-line msg "downloading ${object}"
-   if ! (set -o pipefail
-         gcloud storage cat "${object}" \
-          | openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -pass env:PASSPHRASE \
-          | zstd -dcq \
-          | tar -xf - -C "${RestoreDir}"); then
-    log-line err "failed to download, decrypt or extract ${object} (incorrect passphrase?)"
-    return 1
-   fi
-  done
+  mapfile -t objects < <(gcloud storage ls --long "${chainURL}/**" 2>/dev/null \
+                          | awk -v suffix="${CLOUD_PIECE_SUFFIX}" '$3 ~ /^gs:/ && substr($3, length($3) - length(suffix) + 1) == suffix { print $3, $1 }')
+  if [ ${#objects[@]} -eq 0 ]; then
+   log-line err "failed to list the pieces of backup chain ${chainTs} in ${chainURL}/"
+   return 1
+  fi
+  download-objects "${chainTs}" zstd ${objects[*]} || return 1
   # the downloaded pieces are already in cloud, so they don't get uploaded again once this becomes a local chain
   local piece
   for piece in $(list-chain-pieces "${RestoreDir}"); do
@@ -1256,14 +1489,9 @@ restore-from-cloud() {
  else
   require-tools bzip2
   latestTs="${legacyTs}"
-  log-line msg "downloading ${legacyFile}"
-  if ! (set -o pipefail
-        gcloud storage cat "${legacyFile}" \
-         | openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -pass env:PASSPHRASE \
-         | tar -xjf - -C "${RestoreDir}"); then
-   log-line err "failed to download, decrypt or extract ${legacyFile} (incorrect passphrase?)"
-   return 1
-  fi
+  local legacySize
+  legacySize=$(gcloud storage ls --long "${legacyFile}" 2>/dev/null | awk '$3 ~ /^gs:/ { print $1; exit }')
+  download-objects "${legacyTs}" bzip2 "${legacyFile}" "${legacySize:-0}" || return 1
  fi
  sync
  local replaceLocal=false
@@ -1637,13 +1865,13 @@ status-restored-binlog-pos() {
  replayed=$(read-datadir-file "${BINLOGS_REPLAYED_NAME}")
  if [ -n "${restored}" ]; then
   local file pos
-  file=$(datadir-file-value "${restored}" file)
-  pos=$(datadir-file-value "${restored}" pos)
-  echo "  restored $(datadir-file-value "${restored}" restored_at) UTC, binlog position after the restore: ${file}:${pos}"
+  file=$(value-of-key "${restored}" file)
+  pos=$(value-of-key "${restored}" pos)
+  echo "  restored $(value-of-key "${restored}" restored_at) UTC, binlog position after the restore: ${file}:${pos}"
   echo "    -> on replicas restored the same way, run '${scriptName} start-replica ${file} ${pos}'"
  fi
- if [ -n "${replayed}" ] && [ -n "${DBMasterHost}" ] && [ "$(datadir-file-value "${replayed}" coordinates)" = "master" ]; then
-  echo "  restored up to $(datadir-file-value "${replayed}" replayed_to) UTC from the master's binlogs, ending at $(datadir-file-value "${replayed}" end_file):$(datadir-file-value "${replayed}" end_pos)"
+ if [ -n "${replayed}" ] && [ -n "${DBMasterHost}" ] && [ "$(value-of-key "${replayed}" coordinates)" = "master" ]; then
+  echo "  restored up to $(value-of-key "${replayed}" replayed_to) UTC from the master's binlogs, ending at $(value-of-key "${replayed}" end_file):$(value-of-key "${replayed}" end_pos)"
   echo "    -> if the master wasn't restored, run '${scriptName} start-replica' to resume replication there"
  fi
 }
@@ -1809,15 +2037,15 @@ read-restored-binlog-pos() {
  replayed=$(read-datadir-file "${BINLOGS_REPLAYED_NAME}")
  if [ -n "${replayed}" ]; then
   local replayedTo
-  replayedTo=$(datadir-file-value "${replayed}" replayed_to)
-  if [ "$(datadir-file-value "${replayed}" coordinates)" != "master" ]; then
+  replayedTo=$(value-of-key "${replayed}" replayed_to)
+  if [ "$(value-of-key "${replayed}" coordinates)" != "master" ]; then
    log-line err "the restore replayed this server's own binlogs (up to ${replayedTo} UTC), so the master position its backup recorded is out of date" >&2
    log-line err "pass the master's binlog position to resume from explicitly: ${scriptName} start-replica <master-log-file> <master-log-pos>" >&2
    return 1
   fi
   log-line msg "resuming where the restore's replay of the master's binlogs ended (up to ${replayedTo} UTC)" >&2
   log-line msg "if the master was restored as well, pass the position its restore logged instead: ${scriptName} start-replica <file> <pos>" >&2
-  echo "$(datadir-file-value "${replayed}" end_file) $(datadir-file-value "${replayed}" end_pos)"
+  echo "$(value-of-key "${replayed}" end_file) $(value-of-key "${replayed}" end_pos)"
   return 0
  fi
  local infoName info logFile logPos
@@ -1917,6 +2145,7 @@ status() {
   status-replication
   status-binlogs
   status-disk-space
+  status-cloud-upload
   # last, since it depends on the network and may take up to STATUS_CLOUD_TIMEOUT_SECONDS
   status-cloud-backups
  } | limit-output "${STATUS_MAX_LINES}" "${STATUS_MAX_COLUMNS}"

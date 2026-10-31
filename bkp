@@ -72,6 +72,7 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
    - each piece is tarred, zstd-compressed, encrypted with ${BOLD}aes-256-cbc${RESET} using ${BOLD}AESPassphrase${RESET} and streamed straight to cloud, using no local disk space
    - an existing cloud object is only replaced once the new upload of that piece succeeds; failed pieces are retried on the next upload
    - waits for any other cloud upload that's still running to finish first
+   - logs its progress every 5 minutes (every 30 seconds on a terminal); ${BOLD}upload-status${RESET} shows it any time
 
   ${BOLD}restore-db-local${RESET} <timestamp> [target-datetime]
    - restores the database from a local backup with the given ${BOLD}timestamp${RESET} in ${BOLD}\${LocalBackupDir}${RESET}
@@ -87,6 +88,7 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
    - downloads the most recent backup chain at or before ${BOLD}[target-datetime]${RESET} (format: yyyy-MM-dd HH:mm:ss, UTC, default: now) from ${BOLD}gs://\${GCSBucket}/${RESET}, decrypts and extracts it into ${BOLD}\${RestoreDir}${RESET} (which must be empty), and moves it into ${BOLD}\${LocalBackupDir}${RESET}
    - also restores single-archive backups uploaded by older bkp versions (needs bzip2)
    - ${BOLD}--from-instance=<name>${RESET} restores another instance's backups instead of ${BOLD}\${BackupInstanceName}${RESET}'s, e.g. a replica's onto its master
+   - logs the download progress every 30 seconds on a terminal (every 5 minutes otherwise); ${BOLD}upload-status${RESET} shows it any time
 
   ${BOLD}install-cron${RESET}
    - installs (or re-installs) weekly/daily/hourly backups as cron jobs, per the ${BOLD}Cron*${RESET} schedule in ${BOLD}.env${RESET}
@@ -100,6 +102,12 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
    - if the database is a replica, shows replication status (log files, positions, seconds behind master, last error)
    - shows where binlogs for point-in-time restore come from, the last one saved, and whether the configuration can work
    - shows free space on the volumes holding ${BOLD}\${DBDataDir}${RESET} and ${BOLD}\${LocalBackupDir}${RESET}
+   - shows the progress of a running cloud upload or download (see ${BOLD}upload-status${RESET})
+
+  ${BOLD}upload-status${RESET}
+   - shows only the progress of a running cloud upload (or download): the chain, the piece going through the archive/compress/encrypt/upload pipeline, how much of it and of the whole upload went through so far, the speed and the time left
+   - says so if no upload is running, or if the last one was killed before it finished
+   - quick and needs no network, e.g. for ${BOLD}watch -n 5 ./bkp upload-status${RESET}
 
   ${BOLD}help${RESET} | ${BOLD}""${RESET} | ${BOLD}-h${RESET} | ${BOLD}--help${RESET}
    - displays this help message
@@ -133,7 +141,7 @@ shift
 . "${scriptDir}/lib/common.sh"
 
 # status reports missing tools itself, in its own section
-[ "${cmd}" != "status" ] && warn-missing-tools
+[ "${cmd}" != "status" ] && [ "${cmd}" != "upload-status" ] && warn-missing-tools
 
 if [ -f "${envFile}" ]; then
  set -a
@@ -184,6 +192,7 @@ case "${cmd}" in
  restart-replication)   restart-replication;;
  start-replica)         start-replica "${@}";;
  status)                status;;
+ upload-status)         upload-status;;
  help|""|-h|--help)
   show-help
   exit 0;;
