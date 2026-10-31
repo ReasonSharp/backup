@@ -5,10 +5,16 @@ stateFile="${LocalBackupDir}/.backup-state"
 lockWeekly="${scriptDir}/weekly.lock"
 lockDaily="${scriptDir}/daily.lock"
 lockHourly="${scriptDir}/hourly.lock"
+lockCloud="${scriptDir}/cloud.lock"
 
 LOCK_FD_WEEKLY=200
 LOCK_FD_DAILY=201
 LOCK_FD_HOURLY=202
+LOCK_FD_CLOUD=203
+MASTER_BINLOG_START_NAME="master-binlog-start"
+CHAIN_CLOSED_NAME=".closed"
+BINLOGS_REPLAYED_NAME="bkp_binlogs_replayed"
+RESTORED_BINLOG_POS_NAME="bkp_restored_binlog_pos"
 
 ALPINE_IMAGE="alpine:3.22"
 BINLOG_UTILITY_IMAGE="bash:5.2.21-alpine3.19"
@@ -19,6 +25,9 @@ BINLOG_PURGE_MAX_AGE_DAYS=14
 STATUS_MAX_LINES=48
 STATUS_MAX_COLUMNS=128
 STATUS_CLOUD_TIMEOUT_SECONDS=5
+ZSTD_LEVEL=3
+CLOUD_MANIFEST_NAME=".cloud-manifest"
+CLOUD_PIECE_SUFFIX=".tar.zst.aes256"
 
 scriptName=$(basename "${0}")
 
@@ -139,16 +148,29 @@ full-backup-stale() {
  [ $((nowEpoch - fullEpoch)) -gt "${FULL_BACKUP_MAX_AGE_SECONDS}" ]
 }
 
+# prints the backup stream in a full/ or inc_*/ dir: zstd-compressed, or plain if made by a bkp version before compression
+stream-file() {
+ local streamFile
+ for streamFile in "${1}/backup.xbstream.zst" "${1}/backup.xbstream"; do
+  if [ -f "${streamFile}" ]; then
+   echo "${streamFile}"
+   return 0
+  fi
+ done
+ return 1
+}
+
 extract-xbstream() {
  local streamFile="${1}"
  local targetDir="${2}"
  log-line msg "extracting ${streamFile} ($(size-of "${streamFile}")) -> ${targetDir}"
  mkdir -p "${targetDir}"
- if ! docker run --rm \
-  -v "$(dirname "${streamFile}")":/source:ro \
-  -v "${targetDir}":/workdir \
-  "${DBBackupImage}" sh -c 'cd /workdir && mbstream -x < "/source/'"$(basename "${streamFile}")"'" \
-                     && chown -R '$(id -u)':'$(id -g)' /workdir'; then
+ local readStream=(cat)
+ [[ "${streamFile}" == *.zst ]] && readStream=(zstd -dcq)
+ if ! (set -o pipefail
+       "${readStream[@]}" "${streamFile}" | docker run --rm -i \
+        -v "${targetDir}":/workdir \
+        "${DBBackupImage}" sh -c 'cd /workdir && mbstream -x && chown -R '$(id -u)':'$(id -g)' /workdir'); then
   log-line err "failed to extract ${streamFile} into ${targetDir} (out of space on that volume?)"
   return 1
  fi
@@ -213,13 +235,14 @@ db-start() {
 ######################################### BACKUP DATABASE #########################################
 ###################################################################################################
 
-# streams a backup into <targetDir>/backup.xbstream, and keeps a copy of its LSN metadata in <targetDir>/lsn so the
-# next incremental can be based on it without unpacking the stream; an incremental is based on <incrementalBaseDir>
+# streams a zstd-compressed backup into <targetDir>/backup.xbstream.zst, and keeps a copy of its LSN metadata in
+# <targetDir>/lsn so the next incremental can be based on it without unpacking the stream; an incremental is based
+# on <incrementalBaseDir>
 run-mariadb-backup() {
  local containerName="${1}"
  local targetDir="${2}"
  local incrementalBaseDir="${3}"
- local streamFile="${targetDir}/backup.xbstream"
+ local streamFile="${targetDir}/backup.xbstream.zst"
  local backupLog="${targetDir}/mariadb-backup.log"
  local remotePassword="${DBRemotePassword:-${DBPassword}}"
  local baseMountArgs=()
@@ -228,9 +251,21 @@ run-mariadb-backup() {
   baseMountArgs=(-v "${incrementalBaseDir}":/base:ro)
   incrementalArg="--incremental-basedir=/base"
  fi
+ # with DBBinlogSource=master, the backup also records the master's binlog coordinates (mariadb_backup_slave_info) that
+ # point-in-time restore replays from, and hourly backups need to know which master binlog to start fetching from
+ local slaveInfoArg=""
+ local masterStartFile=""
+ if [ "${DBBinlogSource}" = "master" ]; then
+  slaveInfoArg="--slave-info"
+  masterStartFile=$(slave-status-field "$(docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SHOW SLAVE STATUS\G" 2>/dev/null)" "Relay_Master_Log_File")
+  if [ -z "${masterStartFile}" ]; then
+   log-line wrn "DBBinlogSource=master, but ${DBContainerName} isn't replicating - this backup can't be used for point-in-time restore"
+  fi
+ fi
  mkdir -p "${targetDir}"
  docker run --rm --name "${containerName}" \
             --log-driver none \
+            -e TZ=UTC \
             -v "${DBDataDir}":/var/lib/mysql:ro \
             "${baseMountArgs[@]}" \
             -v "${targetDir}":/backup:rw \
@@ -240,16 +275,22 @@ run-mariadb-backup() {
                                     --target-dir=/backup \
                                     --extra-lsndir=/backup/lsn \
                                     '"${incrementalArg}"' \
+                                    '"${slaveInfoArg}"' \
                                     --stream=xbstream \
                                     --host="'"${DBHost}"'" \
                                     --port="'"${DBPort}"'" \
                                     --user="'"${DBUser}"'" \
                                     --password="'"${remotePassword}"'" \
-                     && chown -R "'"$(id -u)":"$(id -g)"'" /backup' > "${streamFile}" 2> "${backupLog}"
- local exitCode=${?}
- if [ ${exitCode} -ne 0 ]; then
-  log-line err "mariadb-backup failed with code ${exitCode}:"
+                     && chown -R "'"$(id -u)":"$(id -g)"'" /backup' 2> "${backupLog}" \
+  | zstd -T0 -"${ZSTD_LEVEL}" -q -c > "${streamFile}"
+ local exitCodes=("${PIPESTATUS[@]}")
+ if [ "${exitCodes[0]}" -ne 0 ]; then
+  log-line err "mariadb-backup failed with code ${exitCodes[0]}:"
   log-tail "${backupLog}"
+  return 1
+ fi
+ if [ "${exitCodes[1]}" -ne 0 ]; then
+  log-line err "compressing the backup stream into ${streamFile} failed (out of space on that volume?)"
   return 1
  fi
  if [ ! -s "${streamFile}" ]; then
@@ -263,13 +304,14 @@ run-mariadb-backup() {
   return 1
  fi
  rm -f "${backupLog}"
+ [ -n "${masterStartFile}" ] && echo "${masterStartFile}" > "${targetDir}/${MASTER_BINLOG_START_NAME}"
  log-line msg "backup file successfully created at ${streamFile} ($(size-of "${streamFile}"))"
 }
 
 bkp-db-weekly() {
  require-db-type
  require-vars DBHost DBPort DBUser DBPassword DBDataDir DBBackupImage
- require-tools docker flock pgrep tar bzip2 openssl gcloud
+ require-tools docker flock pgrep tar zstd openssl gcloud
  log-line msg "=== STARTING WEEKLY BACKUP ==="
  acquire-lock "${lockWeekly}" ${LOCK_FD_WEEKLY}
  terminate-lower-priority 3
@@ -286,7 +328,9 @@ bkp-db-weekly() {
   fi
  done
  if run-mariadb-backup "mariadb-backup-full-${ts}" "${fullDir}"; then
-  if [[ -n "${prevBkp}" ]]; then
+  if [[ -n "${prevBkp}" ]] && [ -f "${LocalBackupDir}/${prevBkp}/${CHAIN_CLOSED_NAME}" ]; then
+   log-line msg "previous backup chain (${prevBkp}) was closed by a restore - nothing appended to it"
+  elif [[ -n "${prevBkp}" ]]; then
    release-lock "${lockWeekly}" "${LOCK_FD_WEEKLY}"
    bkp-db-daily "${prevBkp}"
    if [ "${?}" -gt 0 ]; then
@@ -294,10 +338,10 @@ bkp-db-weekly() {
     exit 1
    fi
    release-lock "${lockDaily}" "${LOCK_FD_DAILY}"
-   bkp-db-hourly "${prevBkp}"
-   if [ "${?}" -gt 0 ]; then
-    log-line err "failed to append previous week - please run '${scriptName} bkp-db-hourly \"${prevBkp}\"' manually"
-    exit 1
+   # missing the last binlogs only limits point-in-time restore of the previous week's last hours, so unlike a missing
+   # incremental, it doesn't stop the rollover
+   if ! bkp-db-hourly "${prevBkp}"; then
+    log-line wrn "couldn't append the last binlogs to previous week's backups - point-in-time restore of its last hours may not be possible"
    fi
    log-line msg "appended daily incremental and binlogs to previous backup archive (${prevBkp}) - ready for sending to cloud"
   else
@@ -306,16 +350,19 @@ bkp-db-weekly() {
   lastFullTs="${ts}"
   lastIncTs=""
   save-state
+  # uploads can take hours - let daily and hourly backups run in the meantime
+  release-lock "${lockWeekly}" "${LOCK_FD_WEEKLY}"
   local result=0
   if [[ -n "${prevBkp}" ]]; then
-   if bkp-to-cloud "${prevBkp}" "weekly"; then
-    rm -rf "${LocalBackupDir}/${prevBkp}"
+   if bkp-to-cloud "${prevBkp}"; then
+    rm -rf "${LocalBackupDir:?}/${prevBkp}"
+    log-line msg "previous week's backups are all in cloud - removed their local copy (${LocalBackupDir}/${prevBkp})"
    else
     log-line wrn "couldn't upload previous week's backups to cloud - keeping them locally (${LocalBackupDir}/${prevBkp})"
     result=1
    fi
   fi
-  if ! bkp-to-cloud "${ts}" "daily"; then
+  if ! bkp-to-cloud "${ts}"; then
    log-line wrn "couldn't upload the new full backup to cloud (${LocalBackupDir}/${ts})"
    result=1
   fi
@@ -335,7 +382,7 @@ bkp-db-weekly() {
 bkp-db-daily() {
  require-db-type
  require-vars DBHost DBPort DBUser DBPassword DBDataDir DBBackupImage
- require-tools docker flock pgrep tar bzip2 openssl gcloud
+ require-tools docker flock pgrep tar zstd openssl gcloud
  if higher-priority-running "${lockWeekly}"; then
   log-line wrn "weekly backup is running - skipping daily"
   return 1
@@ -358,7 +405,7 @@ bkp-db-daily() {
   fullTs="${1}"
  fi
  local bkpRoot="${LocalBackupDir}/${fullTs}/mariadb"
- if [[ ! -f "${bkpRoot}/full/backup.xbstream" ]]; then
+ if ! stream-file "${bkpRoot}/full" >/dev/null; then
   log-line err "no full backup found for ${fullTs} - error in ${stateFile}?"
   return 1
  fi
@@ -387,14 +434,20 @@ bkp-db-daily() {
  local extractDir=""
  if ! has-lsn-metadata "${incBaseDir}"; then
   log-line msg "no LSN metadata saved alongside ${lastFullDir} (made by an older version of bkp) - unpacking it to read it"
+  local baseStream
+  if ! baseStream=$(stream-file "${lastFullDir}"); then
+   log-line err "no backup stream found in ${lastFullDir}, so it's a broken backup"
+   log-line err "move ${lastFullDir} out of ${bkpRoot}, so the next daily backup is based on the backup before it"
+   return 1
+  fi
   extractDir=$(make-work-dir) || return 1
-  if ! extract-xbstream "${lastFullDir}/backup.xbstream" "${extractDir}"; then
+  if ! extract-xbstream "${baseStream}" "${extractDir}"; then
    remove-extracted "${extractDir}"
    return 1
   fi
   incBaseDir="${extractDir}"
   if ! has-lsn-metadata "${incBaseDir}"; then
-   log-line err "${lastFullDir}/backup.xbstream contains no LSN metadata, so it's probably a broken backup"
+   log-line err "${baseStream} contains no LSN metadata, so it's probably a broken backup"
    log-line err "move ${lastFullDir} out of ${bkpRoot}, so the next daily backup is based on the backup before it"
    remove-extracted "${extractDir}"
    return 1
@@ -406,9 +459,13 @@ bkp-db-daily() {
   save-state
   local result=0
   bkp-folders "${fullTs}"
-  if [[ -z "${1}" ]] && ! bkp-to-cloud "${fullTs}" "daily"; then
-   log-line wrn "couldn't upload backup chain ${fullTs} to cloud (${LocalBackupDir}/${fullTs})"
-   result=1
+  if [[ -z "${1}" ]]; then
+   # the upload can take a while - let hourly backups run in the meantime
+   release-lock "${lockDaily}" ${LOCK_FD_DAILY}
+   if ! bkp-to-cloud "${fullTs}"; then
+    log-line wrn "couldn't upload backup chain ${fullTs} to cloud (${LocalBackupDir}/${fullTs})"
+    result=1
+   fi
   fi
   if [ ${result} -eq 0 ]; then
    log-line msg "=== DAILY BACKUP COMPLETED ==="
@@ -423,9 +480,114 @@ bkp-db-daily() {
   return 1
  fi
 }
+require-binlog-source() {
+ require-vars DBContainerName DBUser DBPassword
+ case "${DBBinlogSource}" in
+  local)  require-vars DBDataDir DBBinlogBasename;;
+  master) require-vars DBMasterHost DBMasterPort DBMasterUser DBMasterPassword DBBackupImage;;
+  *)
+   log-line err "unknown DBBinlogSource '${DBBinlogSource}' - use 'local' or 'master' (edit ${envFile})"
+   exit 1;;
+ esac
+}
+
+# prints why the database's own binlogs can't be used for point-in-time restore - nothing if they can, or if the
+# database isn't up to check
+local-binlog-problem() {
+ local settings
+ settings=$(docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -N -B \
+             -e "SELECT CONCAT_WS('|', IF(@@log_bin, 1, 0), IFNULL(@@log_bin_basename, ''), IF(@@log_slave_updates, 1, 0))" 2>/dev/null) || return 0
+ local logBin binlogPath slaveUpdates
+ IFS='|' read -r logBin binlogPath slaveUpdates <<< "${settings}"
+ local binlogName
+ binlogName=$(basename "${binlogPath}")
+ if [ "${logBin}" != "1" ]; then
+  echo "${DBContainerName} doesn't write a binlog (log_bin=0) - enable log_bin, or if it's a replica, set DBBinlogSource=master"
+ elif [ "${binlogName}" != "${DBBinlogBasename}" ]; then
+  echo "DBBinlogBasename is '${DBBinlogBasename}', but ${DBContainerName}'s binlog is '${binlogName}' - set DBBinlogBasename=\"${binlogName}\""
+ elif [ "${slaveUpdates}" != "1" ] \
+      && [ -n "$(docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SHOW SLAVE STATUS\G" 2>/dev/null)" ]; then
+  echo "${DBContainerName} is a replica without log_slave_updates, so its binlog lacks the replicated changes - enable log_slave_updates, or set DBBinlogSource=master"
+ fi
+}
+
+copy-local-binlogs() {
+ local fullTs="${1}"
+ local binlogDir="${2}"
+ local problem
+ problem=$(local-binlog-problem)
+ if [ -n "${problem}" ]; then
+  log-line err "binlogs can't be used for point-in-time restore: ${problem}"
+  return 1
+ fi
+ log-line msg "archiving binlogs newer than ${fullTs}"
+ local sinceEpoch
+ sinceEpoch=$(date -u -d "${fullTs:0:4}-${fullTs:4:2}-${fullTs:6:2} ${fullTs:8:2}:${fullTs:10:2}:${fullTs:12:2}" +%s 2>/dev/null || echo 0)
+ local safeSinceEpoch=$((sinceEpoch - 7200))
+ if docker run --rm -v "${DBDataDir}":/var/lib/mysql:ro \
+               -v "${binlogDir}":/target \
+               "${BINLOG_UTILITY_IMAGE}" bash -c 'cd /var/lib/mysql || exit 1
+                                               files=()
+                                               for f in "'"${DBBinlogBasename}"'".[0-9]* "'"${DBBinlogBasename}"'".index; do
+                                                [[ -f "${f}" ]] || continue
+                                                mtime=$(stat -c %Y "${f}" 2>/dev/null || echo 0)
+                                                if [[ "${mtime}" -ge '"${safeSinceEpoch}"' ]]; then
+                                                 files+=("${f}")
+                                                fi
+                                               done
+                                               if [ ${#files[@]} -eq 0 ]; then
+                                                echo "'"$(log-line msg "nothing to backup")"'"
+                                                exit 0
+                                               fi
+                                               for f in ${files[@]}; do
+                                                cp -p "${f}" /target/ || exit 1
+                                               done
+                                               chown '$(id -u)':'$(id -g)' "/target/"*'; then
+  log-line msg "binlogs successfully copied to ${binlogDir}/ ($(size-of "${binlogDir}") in total)"
+ else
+  log-line err "copying binlogs failed"
+  return 1
+ fi
+}
+
+fetch-master-binlogs() {
+ local chainDir="${1}"
+ local binlogDir="${2}"
+ # the earliest master binlog any backup of this chain starts in
+ local startFile
+ startFile=$(cat "${chainDir}/mariadb/full/${MASTER_BINLOG_START_NAME}" "${chainDir}"/mariadb/inc_*/"${MASTER_BINLOG_START_NAME}" 2>/dev/null \
+              | sort | head -1)
+ if [ -z "${startFile}" ]; then
+  log-line wrn "no backup of chain $(basename "${chainDir}") recorded where it is in the master's binlogs (made by an older bkp version, or not with DBBinlogSource=master)"
+  log-line wrn "nothing to fetch - point-in-time restore becomes possible from the next daily or weekly backup on"
+  return 0
+ fi
+ # the newest binlog fetched so far may have grown since, so fetching resumes from it
+ local fetched
+ fetched=$(ls "${binlogDir}" 2>/dev/null | grep -E "^${startFile%.*}\.[0-9]+$" | sort | tail -1)
+ [[ -n "${fetched}" ]] && [[ "${fetched}" > "${startFile}" ]] && startFile="${fetched}"
+ log-line msg "fetching the master's binlogs from ${startFile} on, from ${DBMasterHost}:${DBMasterPort}"
+ local fetchLog="${binlogDir}/.fetch.log"
+ if ! docker run --rm "${dbNetworkArgs[@]}" -e TZ=UTC \
+               -v "${binlogDir}":/target \
+               "${DBBackupImage}" bash -c 'cd /target \
+                                           && mariadb-binlog --read-from-remote-server --raw --to-last-log \
+                                                             --host="'"${DBMasterHost}"'" --port="'"${DBMasterPort}"'" \
+                                                             --user="'"${DBMasterUser}"'" --password="'"${DBMasterPassword}"'" \
+                                                             "'"${startFile}"'" \
+                                           && chown '$(id -u)':'$(id -g)' /target/*' 2> "${fetchLog}"; then
+  log-line err "fetching the master's binlogs failed:"
+  log-tail "${fetchLog}"
+  rm -f "${fetchLog}"
+  return 1
+ fi
+ rm -f "${fetchLog}"
+ log-line msg "master's binlogs successfully fetched to ${binlogDir}/ ($(size-of "${binlogDir}") in total)"
+}
+
 bkp-db-hourly() {
  require-db-type
- require-vars DBDataDir DBBinlogBasename DBContainerName DBUser DBPassword
+ require-binlog-source
  require-tools docker flock
  if higher-priority-running "${lockWeekly}" || higher-priority-running "${lockDaily}"; then
   log-line wrn "higher priority backup running - skipping hourly"
@@ -447,46 +609,254 @@ bkp-db-hourly() {
  elif [[ -n "${1}" ]]; then
   fullTs="${1}"
  fi
- local ts
- ts=$(date -u +"%Y%m%d%H%M%S")
  local binlogDir="${LocalBackupDir}/${fullTs}/mariadb/binlogs"
  mkdir -p "${binlogDir}"
- local since="${fullTs}"
- log-line msg "archiving binlogs newer than ${since}"
- local sinceEpoch
- sinceEpoch=$(date -d "${since:0:4}-${since:4:2}-${since:6:2} ${since:8:2}:${since:10:2}:${since:12:2}" +%s 2>/dev/null || echo 0)
- local safeSinceEpoch=$((sinceEpoch - 7200))
- if docker run --rm -v "${DBDataDir}":/var/lib/mysql:ro \
-               -v "${binlogDir}":/target \
-               "${BINLOG_UTILITY_IMAGE}" bash -c 'cd /var/lib/mysql || exit 1
-                                               files=()
-                                               for f in "'"${DBBinlogBasename}"'".[0-9]* "'"${DBBinlogBasename}"'".index; do
-                                                [[ -f "${f}" ]] || continue
-                                                mtime=$(stat -c %Y "${f}" 2>/dev/null || echo 0)
-                                                if [[ "${mtime}" -ge '"${safeSinceEpoch}"' ]]; then
-                                                 files+=("${f}")
-                                                fi
-                                               done
-                                               if [ ${#files[@]} -eq 0 ]; then
-                                                echo "'"$(log-line msg "nothing to backup")"'"
-                                                exit 0
-                                               fi
-                                               for f in ${files[@]}; do
-                                                cp "${f}" /target/ || exit 1
-                                               done
-                                               chown '$(id -u)':'$(id -g)' "/target/"*'; then
-  log-line msg "binlogs successfully copied to ${binlogDir}/ ($(size-of "${binlogDir}") in total)"
-  purge-old-binlogs
-  log-line msg "=== HOURLY BACKUP COMPLETED ==="
+ local result=0
+ if [ "${DBBinlogSource}" = "master" ]; then
+  fetch-master-binlogs "${LocalBackupDir}/${fullTs}" "${binlogDir}" || result=1
  else
-  log-line err "hourly backup failed with code ${?}"
+  copy-local-binlogs "${fullTs}" "${binlogDir}" || result=1
+ fi
+ if [ ${result} -ne 0 ]; then
+  log-line err "hourly backup failed"
   return 1
  fi
+ purge-old-binlogs
+ log-line msg "=== HOURLY BACKUP COMPLETED ==="
 }
 
 ###################################################################################################
 ######################################## RESTORE DATABASE #########################################
 ###################################################################################################
+
+# prints "<coordinates> <start position> <binlog file>..." to replay on top of the prepared backup in <backupDir>, from
+# the binlogs saved in <binlogDir>: the master's binlogs (coordinates "master") if the backup was made on a replica
+# with DBBinlogSource=master (so a master can be restored from a replica's backup too), or the server's own binlogs
+# (coordinates "own") otherwise; reasons it can't are logged at <level> (default err)
+plan-binlog-replay() {
+ local backupDir="${1}"
+ local binlogDir="${2}"
+ local level="${3:-err}"
+ local positions=() kinds=()
+ local info
+ info=$(cat "${backupDir}/mariadb_backup_slave_info" "${backupDir}/xtrabackup_slave_info" 2>/dev/null)
+ if [ -n "${info}" ]; then
+  positions+=("$(sed -nE "s/.*MASTER_LOG_FILE *= *'([^']+)'.*MASTER_LOG_POS *= *([0-9]+).*/\1 \2/Ip" <<< "${info}" | head -1)")
+  kinds+=("master")
+ fi
+ info=$(cat "${backupDir}/mariadb_backup_binlog_info" "${backupDir}/xtrabackup_binlog_info" 2>/dev/null | head -1)
+ if [ -n "${info}" ]; then
+  positions+=("$(awk '{ print $1, $2 }' <<< "${info}")")
+  kinds+=("own")
+ fi
+ local i startFile="" startPos="" coordinates="" triedFiles=""
+ for ((i=0; i<${#positions[@]}; i++)); do
+  read -r startFile startPos <<< "${positions[i]}"
+  coordinates="${kinds[i]}"
+  [ -n "${startFile}" ] && [ -n "${startPos}" ] && [ -f "${binlogDir}/${startFile}" ] && break
+  triedFiles+=" ${startFile}"
+  startFile=""
+ done
+ if [ -z "${startFile}" ]; then
+  if [ -z "${triedFiles// /}" ]; then
+   log-line "${level}" "the backup didn't record a binlog position - it was made on a server without a binlog, and not with DBBinlogSource=master" >&2
+  else
+   log-line "${level}" "the binlog the backup ends in (${triedFiles# }) wasn't saved in ${binlogDir}" >&2
+  fi
+  return 1
+ fi
+ # every binlog from the start file on, without gaps
+ local baseName="${startFile%.*}"
+ local startNumber="${startFile##*.}"
+ local expected=$((10#${startNumber}))
+ local files=()
+ local path name
+ for path in "${binlogDir}/${baseName}".*; do
+  name=$(basename "${path}")
+  [[ "${name}" =~ ^.+\.[0-9]+$ ]] || continue
+  [[ "${name}" < "${startFile}" ]] && continue
+  if [ $((10#${name##*.})) -ne ${expected} ]; then
+   log-line "${level}" "$(printf "%s.%0${#startNumber}d" "${baseName}" "${expected}") is missing from ${binlogDir}" >&2
+   return 1
+  fi
+  files+=("${name}")
+  expected=$((expected + 1))
+ done
+ echo "${coordinates} ${startPos} ${files[*]}"
+}
+
+# finds where replaying the binlogs in <pitrDir> (from <start position> in the first one) has to end, so it ends
+# between two transactions: before the first one that started at or after <target> (yyyyMMddHHmmss, UTC; empty means
+# replay everything); prints "<index of the last file to replay> <stop position in it, 0 for its end> <binlog file>
+# <position>" the replay ends at, in the binlogs' own coordinates, and "<time of the last replayed event>"
+find-replay-end() {
+ local pitrDir="${1}"
+ local startPos="${2}"
+ local targetTs="${3}"
+ shift 3
+ # one file at a time, since mariadb-binlog doesn't mark where one file ends and the next begins
+ docker run --rm -e TZ=UTC -v "${pitrDir}":/pitr:ro "${DBBackupImage}" bash -c '
+  startPos="${1}"; shift
+  for file in "${@}"; do
+   echo "@@FILE ${file}"
+   mariadb-binlog --no-defaults --base64-output=decode-rows --start-position="${startPos}" "/pitr/${file}" || exit 1
+   startPos=4
+  done' _ "${startPos}" "${@}" \
+  | awk -v target="${targetTs}" -v endFile="${1}" -v endPos="${startPos}" '
+   found { next }
+   /^@@FILE / { file = $2; fileIndex++; next }
+   /^# at [0-9]+$/ { at = $3; next }
+   /^#[0-9][0-9][0-9][0-9][0-9][0-9] +[0-9]+:[0-9][0-9]:[0-9][0-9] server id / {
+    split($2, t, ":")
+    ts = sprintf("20%s%02d%s%s", substr($1, 2), t[1], t[2], t[3])
+    # every transaction starts with a GTID event
+    if (target != "" && index($0, "\tGTID ") && ts >= target) {
+     printf "%d %d %s %d %s\n", fileIndex - 1, at, file, at, lastTs
+     found = 1
+     next
+    }
+    lastTs = ts
+    for (i = 1; i < NF; i++) if ($i == "end_log_pos" && $(i + 1) > 0) { endFile = file; endPos = $(i + 1) }
+    if (match($0, /\tRotate to [^ ]+ +pos: [0-9]+/)) { split(substr($0, RSTART + 11), r, " "); endFile = r[1]; endPos = r[3] }
+   }
+   END { if (!found) printf "%d 0 %s %d %s\n", fileIndex - 1, endFile, endPos, lastTs }'
+ local status=("${PIPESTATUS[@]}")
+ [ "${status[0]}" -eq 0 ] && [ "${status[1]}" -eq 0 ]
+}
+
+# yyyyMMddHHmmss -> yyyy-MM-dd HH:mm:ss
+format-ts() {
+ local ts="${1}"
+ echo "${ts:0:4}-${ts:4:2}-${ts:6:2} ${ts:8:2}:${ts:10:2}:${ts:12:2}"
+}
+
+# writes stdin to <name> in ${DBDataDir}
+write-datadir-file() {
+ docker run --rm -i -v "${DBDataDir}":/datadir "${ALPINE_IMAGE}" sh -c 'cat > "/datadir/${1}"' _ "${1}"
+}
+
+read-datadir-file() {
+ docker run --rm -v "${DBDataDir}":/datadir:ro "${ALPINE_IMAGE}" cat "/datadir/${1}" 2>/dev/null
+}
+
+# prints the value of <key> in the "key=value" lines of <content>
+datadir-file-value() {
+ sed -n "s/^${2}=//p" <<< "${1}" | head -1
+}
+
+# replays <binlogPlan> (from plan-binlog-replay) up to <targetDatetimeStr> (UTC; empty replays every saved binlog),
+# then records in BINLOGS_REPLAYED_NAME where in those binlogs the replay ended, for start-replica
+apply-binlogs() {
+ local binlogPlan="${1}"
+ local binlogDir="${2}"
+ local targetDatetimeStr="${3}"
+ local coordinates startPos
+ local files=()
+ read -r coordinates startPos _ <<< "${binlogPlan}"
+ read -r -a files <<< "$(cut -d' ' -f3- <<< "${binlogPlan}")"
+ local pitrDir
+ if ! pitrDir=$(make-work-dir); then
+  log-line err "binlogs not applied"
+  return 1
+ fi
+ local file
+ for file in "${files[@]}"; do
+  if ! cp "${binlogDir}/${file}" "${pitrDir}/"; then
+   log-line err "failed to copy ${binlogDir}/${file} to ${pitrDir} - binlogs not applied"
+   rm -rf "${pitrDir}"
+   return 1
+  fi
+ done
+ local targetTs=""
+ [ -n "${targetDatetimeStr}" ] && targetTs=$(date -u -d "${targetDatetimeStr}" +"%Y%m%d%H%M%S")
+ local replayEnd lastIndex stopPos endFile endPos lastEventTs
+ if ! replayEnd=$(find-replay-end "${pitrDir}" "${startPos}" "${targetTs}" "${files[@]}") || [ -z "${replayEnd}" ]; then
+  log-line err "failed to read the binlogs copied to ${pitrDir} - binlogs not applied"
+  rm -rf "${pitrDir}"
+  return 1
+ fi
+ read -r lastIndex stopPos endFile endPos lastEventTs <<< "${replayEnd}"
+ local reachedDatetime
+ if [ "${stopPos}" -gt 0 ]; then
+  reachedDatetime="${targetDatetimeStr}"
+ else
+  reachedDatetime=$(format-ts "${lastEventTs}")
+  if [ -n "${targetTs}" ] && [[ "${lastEventTs}" < "${targetTs}" ]]; then
+   log-line wrn "the saved binlogs only reach ${reachedDatetime} UTC - the database can only be brought forward to then, not to ${targetDatetimeStr} UTC"
+  fi
+ fi
+ files=("${files[@]:0:lastIndex+1}")
+ local result=0
+ if [ "${lastIndex}" -eq 0 ] && [ "${stopPos}" -gt 0 ] && [ "${stopPos}" -le "${startPos}" ]; then
+  log-line msg "no transactions between the end of the backup and ${targetDatetimeStr} UTC - no binlogs to replay"
+ else
+  log-line msg "replaying ${#files[@]} binlog(s) from ${files[0]}:${startPos} to ${endFile}:${endPos} (up to ${reachedDatetime} UTC)..."
+  local fileArgs="" stopArg=""
+  for file in "${files[@]}"; do
+   fileArgs+=" \"/pitr/${file}\""
+  done
+  # --stop-position applies to the last file; stopping where a transaction starts never leaves half of one applied
+  [ "${stopPos}" -gt 0 ] && stopArg=" --stop-position=${stopPos}"
+  # --disable-log-bin: the replayed transactions don't go into this server's binlog, so its binlog position after the
+  # restore is where it starts writing new transactions (see record-restored-binlog-pos)
+  cat > "${pitrDir}/import-script.sh" <<IMPORT
+#!/bin/bash
+set -o pipefail
+TZ=UTC mariadb-binlog --no-defaults --disable-log-bin --set-charset=utf8mb4 --start-position="${startPos}"${stopArg}${fileArgs} \\
+ | mariadb -u"${DBUser}" -p"${DBPassword}"
+IMPORT
+  chmod +x "${pitrDir}/import-script.sh"
+  docker exec "${DBContainerName}" rm -rf /pitr
+  if ! docker cp "${pitrDir}" "${DBContainerName}:/pitr" >/dev/null; then
+   log-line err "failed to copy binlogs into ${DBContainerName} - binlogs not applied"
+   result=1
+  elif ! docker exec "${DBContainerName}" /pitr/import-script.sh; then
+   log-line err "replaying binlogs failed - the database is restored to the end of the backup, plus whatever was replayed before the error"
+   result=1
+  else
+   log-line msg "binlogs replayed up to ${reachedDatetime} UTC"
+  fi
+  docker exec "${DBContainerName}" rm -rf /pitr
+ fi
+ rm -rf "${pitrDir}"
+ [ ${result} -ne 0 ] && return ${result}
+ # the position the backup recorded is out of date now - start-replica resumes from where the replay ended instead
+ printf "replayed_to=%s\ncoordinates=%s\nend_file=%s\nend_pos=%s\n" "${reachedDatetime}" "${coordinates}" "${endFile}" "${endPos}" \
+  | write-datadir-file "${BINLOGS_REPLAYED_NAME}"
+ # only worth mentioning on a replica: a master restored from a replica's backup replays the same binlogs
+ if [ "${coordinates}" = "master" ] && [ -n "${DBMasterHost}" ]; then
+  log-line msg "if the master wasn't restored, '${scriptName} start-replica' resumes replicating where the replay ended (${endFile}:${endPos})"
+  log-line msg "if it was restored the same way, start replicating with the position its restore logged: ${scriptName} start-replica <file> <pos>"
+ fi
+}
+
+# records this server's own binlog position right after a restore in RESTORED_BINLOG_POS_NAME (replayed binlogs don't
+# go into it): a replica restored the same way starts replicating from this server there
+record-restored-binlog-pos() {
+ local masterStatus logFile logPos
+ masterStatus=$(docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -N -B -e "SHOW MASTER STATUS" 2>/dev/null)
+ read -r logFile logPos _ <<< "${masterStatus}"
+ if [ -z "${logFile}" ] || [ -z "${logPos}" ]; then
+  return 0
+ fi
+ printf "restored_at=%s\nfile=%s\npos=%s\n" "$(date -u +"%Y-%m-%d %H:%M:%S")" "${logFile}" "${logPos}" \
+  | write-datadir-file "${RESTORED_BINLOG_POS_NAME}"
+ log-line msg "binlog position after the restore: ${logFile}:${logPos} - replicas restored with the same command start replicating from here with:"
+ log-line msg "  ${scriptName} start-replica ${logFile} ${logPos}"
+}
+
+# the restored database no longer continues from the LSNs the local backup chains end in, so the next backup has to
+# be a full one, and no chain can have an incremental appended at the next weekly rollover
+close-backup-chains() {
+ local chainDir
+ for chainDir in "${LocalBackupDir}"/[0-9]*; do
+  [ -d "${chainDir}" ] && touch "${chainDir}/${CHAIN_CLOSED_NAME}"
+ done
+ lastFullTs=""
+ lastIncTs=""
+ save-state
+ log-line msg "the next backup will be a full one, starting a new backup chain"
+}
 
 perform-restore() { # TODO: if isPITR=1, find the full backup that precedes targetDatetimeStr
  local isPITR="${1}"
@@ -522,7 +892,19 @@ perform-restore() { # TODO: if isPITR=1, find the full backup that precedes targ
  rm -f "${prepareLog}"
  local backupEndDatetime
  backupEndDatetime=$(grep '^end_time' "${baseDir}/mariadb_backup_info" | awk -F '= ' '{gsub(/"/,"",$2); print $2}' | xargs)
- log-line msg "backup chain consistent as of: ${backupEndDatetime}"
+ log-line msg "backup chain consistent as of: ${backupEndDatetime} UTC"
+ local binlogDir="${LocalBackupDir}/${ts}/mariadb/binlogs"
+ local binlogPlan=""
+ if [ "${isPITR}" = "1" ]; then
+  if [[ "${backupEndDatetime}" < "${targetDatetimeStr}" ]] && ! binlogPlan=$(plan-binlog-replay "${restoreDBDir}/base" "${binlogDir}"); then
+   log-line err "can't replay binlogs from the end of the backup (${backupEndDatetime} UTC) to ${targetDatetimeStr} UTC - the database was left untouched"
+   return 1
+  fi
+ elif [ -z "$(ls -A "${binlogDir}" 2>/dev/null)" ]; then
+  log-line msg "no binlogs saved after the backup - restoring to the end of the backup (${backupEndDatetime} UTC)"
+ elif ! binlogPlan=$(plan-binlog-replay "${restoreDBDir}/base" "${binlogDir}" wrn); then
+  log-line wrn "the saved binlogs can't be replayed - restoring to the end of the backup (${backupEndDatetime} UTC)"
+ fi
  log-line msg "stopping MariaDB container..."
  docker stop "${DBContainerName}" || true
  local corruptedDir="${DBDataDir}-corrupted-$(date -u +"%Y%m%d%H%M%S")"
@@ -541,69 +923,26 @@ perform-restore() { # TODO: if isPITR=1, find the full backup that precedes targ
   return 1
  fi
  rm -f "${prepareLog}"
+ # in case a backup made after an earlier restore carried them along
+ docker run --rm -v "${DBDataDir}":/datadir "${ALPINE_IMAGE}" \
+  rm -f "/datadir/${BINLOGS_REPLAYED_NAME}" "/datadir/${RESTORED_BINLOG_POS_NAME}"
+ close-backup-chains
  log-line msg "starting MariaDB container..."
  docker start "${DBContainerName}"
  wait-for-db "${DBContainerName}" "${DBUser}" "${DBPassword}"
- if [ "${isPITR}" = "1" ] && [[ "${backupEndDatetime}" < "${targetDatetimeStr}" ]]; then
-  log-line msg "applying binary logs from ${backupEndDatetime} -> ${targetDatetimeStr}..."
-  local pitrDir
-  if ! pitrDir=$(make-work-dir); then
-   log-line err "binary logs not applied - the database is restored to ${backupEndDatetime}"
-   return 1
-  fi
-  cp "${LocalBackupDir}/${ts}/mariadb/binlogs/"* "${pitrDir}"
-  if [ "${?}" -ne 0 ]; then
-   log-line msg "failed to copy binary logs to PITR folder"
-  else
-   local binlogFiles=($(ls "${pitrDir}"/"${DBBinlogBasename}".* 2>/dev/null | grep -v ".idx" | grep -v ".index" | sort))
-   if [ ${#binlogFiles[@]} -gt 0 ]; then
-    local binlogPosFile="${restoreDBDir}/base/mariadb_backup_binlog_info"
-    local startFile
-    startFile=$(awk '{print $1}' "${binlogPosFile}")
-    local startPos
-    startPos=$(awk '{print $2}' "${binlogPosFile}")
-    local binlogCmd="mariadb-binlog --no-defaults --set-charset=utf8mb4"
-    local started=0
-    local bp bf
-    for bp in "${binlogFiles[@]}"; do
-     bf=$(basename "${bp}")
-     if [[ "${bf}" < "${startFile}" ]]; then continue; fi
-     if [[ "${bf}" == "${startFile}" ]]; then
-      binlogCmd="${binlogCmd} \"/pitr/$(basename ${bf})\" --start-position=\"${startPos}\""
-      started=1
-     elif [ ${started} = 1 ]; then
-      binlogCmd="${binlogCmd} \"/pitr/$(basename ${bf})\""
-     fi
-    done
-    binlogCmd="${binlogCmd} --stop-datetime=\"${targetDatetimeStr}\""
-    log-line msg "executing: ${binlogCmd} | mariadb"
-    echo '#!/bin/bash' > ./import-script.sh
-    echo "${binlogCmd} | mariadb -u "${DBUser}" -p${DBPassword}" >> ./import-script.sh
-    echo "rm -rf /pitr" >> ./import-script.sh
-    chmod +x ./import-script.sh
-    docker cp ./import-script.sh "${DBContainerName}:/import-script.sh"
-    docker cp "${pitrDir}" "${DBContainerName}:/pitr"
-    docker exec "${DBContainerName}" /import-script.sh
-    docker exec "${DBContainerName}" rm -rf /import-script.sh /pitr
-    rm ./import-script.sh
-    log-line msg "binary logs applied successfully"
-   else
-    log-line msg "no individual binlog files found after extraction"
-   fi
-  fi
-  rm -rf "${pitrDir}"
- else
-  if [ "${isPITR}" = "1" ]; then
-   log-line msg "target time (${targetDatetimeStr}) is not after backup end time (${backupEndDatetime}) -> no binlog apply needed"
-  fi
+ if [ -n "${binlogPlan}" ]; then
+  apply-binlogs "${binlogPlan}" "${binlogDir}" "${targetDatetimeStr}" || return 1
+ elif [ "${isPITR}" = "1" ]; then
+  log-line msg "target time (${targetDatetimeStr} UTC) is not after backup end time (${backupEndDatetime} UTC) -> no binlog apply needed"
  fi
+ record-restored-binlog-pos
  log-line msg "=== RESTORE COMPLETED successfully ==="
 }
 
 restore-db-local() {
  require-db-type
  require-vars DBDataDir DBContainerName DBPassword DBBackupImage DBBinlogBasename
- require-tools docker
+ require-tools docker zstd
  local ts="${1}"
  local targetDatetimeStr="${2}"
  if [ -z "${ts}" ]; then
@@ -613,15 +952,16 @@ restore-db-local() {
  local isPITR=0
  local targetTs="99999999999999"
  if [ -n "${targetDatetimeStr}" ]; then
-  if ! date -d "${targetDatetimeStr}" >/dev/null 2>&1; then
+  if ! date -u -d "${targetDatetimeStr}" >/dev/null 2>&1; then
    log-line err "invalid datetime format for ${targetDatetimeStr} (use yyyy-MM-dd HH:mm:ss)"
    return 1
   fi
-  targetTs=$(date -d "${targetDatetimeStr}" +"%Y%m%d%H%M%S")
+  targetTs=$(date -u -d "${targetDatetimeStr}" +"%Y%m%d%H%M%S")
+  targetDatetimeStr=$(date -u -d "${targetDatetimeStr}" +"%Y-%m-%d %H:%M:%S")
   isPITR=1
-  log-line msg "=== POINT-IN-TIME RESTORE to ${targetDatetimeStr} ==="
+  log-line msg "=== POINT-IN-TIME RESTORE to ${targetDatetimeStr} UTC ==="
  else
-  log-line msg "=== RESTORE to latest available backup (no PITR) ==="
+  log-line msg "=== RESTORE to the latest point the backup chain reaches ==="
  fi
  local backupRoot="${LocalBackupDir}/${ts}/mariadb"
  local restoreDBDir="${RestoreDir}/mariadb"
@@ -643,15 +983,20 @@ restore-db-local() {
   fi
  done
  log-line msg "selected ${#selectedIncDirs[@]} incremental backup(s)"
- local fullStream="${selectedFullDir}/backup.xbstream"
+ local fullStream
+ if ! fullStream=$(stream-file "${selectedFullDir}"); then
+  log-line err "no backup stream found in ${selectedFullDir}"
+  return 1
+ fi
  if ! extract-xbstream "${fullStream}" "${restoreDBDir}/base"; then
   remove-extracted "${restoreDBDir}"
   return 1
  fi
  local i
  for ((i=0; i<${#selectedIncDirs[@]}; i++)); do
-  local incStream="${selectedIncDirs[i]}/backup.xbstream"
-  if ! extract-xbstream "${incStream}" "${restoreDBDir}/_inc_${i}"; then
+  local incStream
+  if ! incStream=$(stream-file "${selectedIncDirs[i]}") || ! extract-xbstream "${incStream}" "${restoreDBDir}/_inc_${i}"; then
+   [ -z "${incStream}" ] && log-line err "no backup stream found in ${selectedIncDirs[i]}"
    remove-extracted "${restoreDBDir}"
    return 1
   fi
@@ -719,53 +1064,135 @@ restore-folders-local() {
 ######################################## CLOUD OPERATIONS #########################################
 ###################################################################################################
 
+# each backup chain is uploaded piece by piece to gs://${GCSBucket}/${BackupInstanceName}/<chain timestamp>/, one
+# object per piece, so a daily upload only sends what's new: the full backup and each incremental once, binlogs once
+# they stop changing, and the backed up folders whenever they change
+
+# pieces of a backup chain, relative to the chain dir
+list-chain-pieces() {
+ local chainDir="${1}"
+ local path
+ [ -d "${chainDir}/mariadb/full" ] && echo "mariadb/full"
+ for path in "${chainDir}"/mariadb/inc_*; do
+  [ -d "${path}" ] && echo "mariadb/$(basename "${path}")"
+ done
+ for path in "${chainDir}"/mariadb/binlogs/*; do
+  [ -f "${path}" ] && echo "mariadb/binlogs/$(basename "${path}")"
+ done
+ [ -d "${chainDir}/files" ] && echo "files"
+}
+# changes whenever a file in the piece is added, removed, resized or modified
+piece-fingerprint() {
+ (cd "${1}" && find "${2}" -type f -printf '%p %s %T@\n' | sort | md5sum | cut -d' ' -f1)
+}
+uploaded-fingerprint() {
+ awk -v piece="${2}" '$1 == piece { print $2 }' "${1}/${CLOUD_MANIFEST_NAME}" 2>/dev/null
+}
+record-uploaded-piece() {
+ local manifest="${1}/${CLOUD_MANIFEST_NAME}"
+ { awk -v piece="${2}" '$1 != piece' "${manifest}" 2>/dev/null; echo "${2} ${3}"; } > "${manifest}.new" && mv "${manifest}.new" "${manifest}"
+}
+cloud-chain-url() {
+ echo "gs://${GCSBucket}/${BackupInstanceName}/${1}"
+}
+# a piece needs uploading if it changed since its last upload, or its object isn't in <cloud object URLs>
+piece-needs-upload() {
+ local chainDir="${1}"
+ local piece="${2}"
+ local objectURL="${3}"
+ local cloudObjects="${4}"
+ [ "$(uploaded-fingerprint "${chainDir}" "${piece}")" != "$(piece-fingerprint "${chainDir}" "${piece}")" ] \
+  || ! grep -qxF "${objectURL}" <<< "${cloudObjects}"
+}
+
+upload-piece() {
+ local chainDir="${1}"
+ local piece="${2}"
+ local objectURL="${3}"
+ local partialURL="${objectURL}.partial"
+ log-line msg "uploading ${piece} ($(size-of "${chainDir}/${piece}")) -> ${objectURL}"
+ export PASSPHRASE="${AESPassphrase}"
+ # streamed straight to cloud, so no local disk space is needed; zstd barely slows down on already compressed streams
+ if ! (set -o pipefail
+       tar -cf - -C "${chainDir}" "${piece}" \
+        | zstd -T0 -"${ZSTD_LEVEL}" -q -c \
+        | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -pass env:PASSPHRASE \
+        | gcloud storage cp - "${partialURL}"); then
+  log-line err "failed to upload ${piece}"
+  gcloud storage rm "${partialURL}" >/dev/null 2>&1
+  return 1
+ fi
+ # a failed or interrupted stream may still leave a complete-looking object behind, so the upload goes to a temporary
+ # name first, and only replaces the previous upload of this piece once the whole stream is known to have made it
+ if ! gcloud storage mv "${partialURL}" "${objectURL}" >/dev/null 2>&1; then
+  log-line err "failed to move ${partialURL} to ${objectURL}"
+  return 1
+ fi
+ local objectSize
+ objectSize=$(gcloud storage ls --long "${objectURL}" 2>/dev/null | awk 'NR == 1 { print $1 }')
+ log-line msg "uploaded ${objectURL} ($(human-size "${objectSize:-0}"))"
+}
+
 bkp-to-cloud() {
  require-cloud-provider
  require-vars GCSBucket AESPassphrase BackupInstanceName
- require-tools tar bzip2 openssl gcloud
+ require-tools tar zstd openssl gcloud flock
  local ts="${1}"
- local level="${2}"
- if [ -z "${ts}" ] || [ -z "${level}" ]; then
-  log-line err "usage: ${scriptName} bkp-to-cloud <timestamp> <weekly|daily>"
+ if [ -z "${ts}" ]; then
+  log-line err "usage: ${scriptName} bkp-to-cloud <timestamp>"
   return 1
  fi
- local srcDir="${LocalBackupDir}/${ts}"
- if [ ! -d "${srcDir}" ]; then
-  log-line err "no local backup found at ${srcDir}"
+ local chainDir="${LocalBackupDir}/${ts}"
+ if [ ! -d "${chainDir}" ]; then
+  log-line err "no local backup found at ${chainDir}"
   return 1
  fi
- local archiveName="${level}-backup.${BackupInstanceName}.${ts}.tar.bz2.aes256"
- local workDir
- workDir=$(make-work-dir) || return 1
- local encryptedPath="${workDir}/${archiveName}"
- local cloudPath="gs://${GCSBucket}/${archiveName}"
- log-line msg "archiving and encrypting ${srcDir} ($(size-of "${srcDir}")) -> ${encryptedPath}"
- export PASSPHRASE="${AESPassphrase}"
- if ! (set -o pipefail
-       tar -cjf - -C "${srcDir}" . | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -out "${encryptedPath}" -pass env:PASSPHRASE); then
-  log-line err "failed to archive and encrypt ${srcDir} (out of space in ${workDir}?) - nothing was uploaded"
-  rm -rf "${workDir}"
+ eval 'exec '${LOCK_FD_CLOUD}'>"'${lockCloud}'"'
+ if ! flock -n ${LOCK_FD_CLOUD}; then
+  log-line msg "waiting for another cloud upload to finish..."
+  flock ${LOCK_FD_CLOUD}
+ fi
+ local chainURL
+ chainURL=$(cloud-chain-url "${ts}")
+ local cloudObjects
+ cloudObjects=$(gcloud storage ls "${chainURL}/**" 2>/dev/null)
+ local pieces=()
+ mapfile -t pieces < <(list-chain-pieces "${chainDir}")
+ local piece objectURL fingerprint
+ local uploaded=0 failed=0
+ for piece in "${pieces[@]}"; do
+  objectURL="${chainURL}/${piece}${CLOUD_PIECE_SUFFIX}"
+  piece-needs-upload "${chainDir}" "${piece}" "${objectURL}" "${cloudObjects}" || continue
+  fingerprint=$(piece-fingerprint "${chainDir}" "${piece}")
+  if upload-piece "${chainDir}" "${piece}" "${objectURL}"; then
+   record-uploaded-piece "${chainDir}" "${piece}" "${fingerprint}"
+   uploaded=$((uploaded + 1))
+  else
+   failed=$((failed + 1))
+  fi
+ done
+ eval 'exec '${LOCK_FD_CLOUD}'>&-'
+ if [ ${failed} -gt 0 ]; then
+  log-line err "${failed} piece(s) of backup chain ${ts} failed to upload - they'll be retried on the next upload"
   return 1
  fi
- log-line msg "encrypted archive created ($(size-of "${encryptedPath}")), uploading to ${cloudPath}"
- # an existing object is only replaced once the new upload completes, so a failed upload leaves it intact
- if ! gcloud storage cp "${encryptedPath}" "${cloudPath}"; then
-  log-line err "failed to upload encrypted archive to cloud, moving it to ${RestoreDir}"
-  mkdir -p "${RestoreDir}"
-  mv "${encryptedPath}" "${RestoreDir}"
-  rm -rf "${workDir}"
-  return 1
- fi
- log-line msg "uploaded ${cloudPath} ($(size-of "${encryptedPath}"))"
- rm -rf "${workDir}"
- if [ "${level}" = "weekly" ]; then
-  gcloud storage rm -q "gs://${GCSBucket}/daily-backup.${BackupInstanceName}.*.tar.bz2.aes256" 2>/dev/null || true
- fi
+ log-line msg "backup chain ${ts} is fully uploaded to ${chainURL}/ (${uploaded} new or changed piece(s) this time)"
 }
 restore-from-cloud() {
  require-cloud-provider
  require-vars GCSBucket AESPassphrase BackupInstanceName
- require-tools gcloud openssl tar bzip2 docker
+ require-tools gcloud openssl zstd tar docker
+ # --from-instance=<name> restores another instance's backups, e.g. a replica's onto its master
+ local BackupInstanceName="${BackupInstanceName}"
+ local args=()
+ local arg
+ for arg in "${@}"; do
+  case "${arg}" in
+   --from-instance=*) BackupInstanceName="${arg#*=}";;
+   *)                 args+=("${arg}");;
+  esac
+ done
+ set -- "${args[@]}"
  local targetDatetime="${1}"
  local ts
  ts=$(date -u +"%Y%m%d%H%M%S")
@@ -776,49 +1203,68 @@ restore-from-cloud() {
   log-line err "invalid datetime format - use 'yyyy-MM-dd HH:mm:ss'"
   return 1
  fi
- local candidates
- candidates=$(gcloud storage ls "gs://${GCSBucket}/*-backup.${BackupInstanceName}.*.tar.bz2.aes256" 2>/dev/null | grep -E ".*-backup\.${BackupInstanceName}\.[0-9]{14}\.tar\.bz2\.aes256$")
- if [[ -z "${candidates}" ]]; then
-  log-line err "no backups found before '${targetDatetime}'"
+ if [ -n "$(ls -A "${RestoreDir}" 2>/dev/null)" ]; then
+  log-line err "${RestoreDir} isn't empty - move its contents elsewhere first"
   return 1
  fi
- local latestFile=""
- local latestTs="00000000000000"
- local line
+ # chains uploaded piece by piece, and single-archive chains uploaded by older bkp versions
+ local chainTs
+ chainTs=$(gcloud storage ls "gs://${GCSBucket}/${BackupInstanceName}/" 2>/dev/null \
+            | sed -nE 's#.*/([0-9]{14})/$#\1#p' | awk -v maxTs="${ts}" '$1 <= maxTs' | sort | tail -1)
+ local legacyFile=""
+ local legacyTs=""
+ local line fileTs
  while IFS= read -r line; do
-  local filename
-  filename=$(basename "${line}")
-  local fileTs
-  fileTs=$(echo "${filename}" | grep -oE '[0-9]{14}' || echo "00000000000000")
-  if [[ "${fileTs}" > "${latestTs}" ]] && [[ ! "${fileTs}" > "${ts}" ]]; then
-   latestTs="${fileTs}"
-   latestFile="${line}"
+  fileTs=$(basename "${line}" | grep -oE '[0-9]{14}')
+  if [[ -n "${fileTs}" ]] && [[ ! "${fileTs}" > "${ts}" ]] && [[ "${fileTs}" > "${legacyTs}" ]]; then
+   legacyTs="${fileTs}"
+   legacyFile="${line}"
   fi
- done <<< "${candidates}"
- if [[ -z "${latestFile}" ]]; then
+ done < <(gcloud storage ls "gs://${GCSBucket}/*-backup.${BackupInstanceName}.*.tar.bz2.aes256" 2>/dev/null \
+           | grep -E ".*-backup\.${BackupInstanceName}\.[0-9]{14}\.tar\.bz2\.aes256$")
+ local latestTs
+ if [[ -z "${chainTs}" ]] && [[ -z "${legacyTs}" ]]; then
   log-line err "no backups found before '${targetDatetime}'"
   return 1
  fi
- local archiveName
- archiveName=$(basename "${latestFile}")
- local localEncryptedPath="${RestoreDir}/${archiveName}"
  mkdir -p "${RestoreDir}"
- if ! gcloud storage cp "${latestFile}" "${localEncryptedPath}"; then
-  log-line err "failed to download backup from cloud"
-  return 1
- fi
  export PASSPHRASE="${AESPassphrase}"
- if ! openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in "${localEncryptedPath}" -out "${RestoreDir}/downloaded-backup.tar.bz2" -pass env:PASSPHRASE; then
-  log-line err "decryption failed (incorrect passphrase?)"
-  rm -f "${localEncryptedPath}"
-  return 1
+ if [[ -n "${chainTs}" ]] && [[ ! "${chainTs}" < "${legacyTs}" ]]; then
+  latestTs="${chainTs}"
+  local chainURL
+  chainURL=$(cloud-chain-url "${chainTs}")
+  local objects=()
+  mapfile -t objects < <(gcloud storage ls "${chainURL}/**" 2>/dev/null | grep -F "${CLOUD_PIECE_SUFFIX}" | grep -vE '\.partial$')
+  log-line msg "downloading backup chain ${chainTs} (${#objects[@]} piece(s)) from ${chainURL}/"
+  local object
+  for object in "${objects[@]}"; do
+   log-line msg "downloading ${object}"
+   if ! (set -o pipefail
+         gcloud storage cat "${object}" \
+          | openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -pass env:PASSPHRASE \
+          | zstd -dcq \
+          | tar -xf - -C "${RestoreDir}"); then
+    log-line err "failed to download, decrypt or extract ${object} (incorrect passphrase?)"
+    return 1
+   fi
+  done
+  # the downloaded pieces are already in cloud, so they don't get uploaded again once this becomes a local chain
+  local piece
+  for piece in $(list-chain-pieces "${RestoreDir}"); do
+   record-uploaded-piece "${RestoreDir}" "${piece}" "$(piece-fingerprint "${RestoreDir}" "${piece}")"
+  done
+ else
+  require-tools bzip2
+  latestTs="${legacyTs}"
+  log-line msg "downloading ${legacyFile}"
+  if ! (set -o pipefail
+        gcloud storage cat "${legacyFile}" \
+         | openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -pass env:PASSPHRASE \
+         | tar -xjf - -C "${RestoreDir}"); then
+   log-line err "failed to download, decrypt or extract ${legacyFile} (incorrect passphrase?)"
+   return 1
+  fi
  fi
- if ! tar xvfj "${RestoreDir}/downloaded-backup.tar.bz2" -C "${RestoreDir}"; then
-  log-line err "failed to extract archive"
-  rm -f "${RestoreDir}/downloaded-backup.tar.bz2" "${localEncryptedPath}"
-  return 1
- fi
- rm -f "${RestoreDir}/downloaded-backup.tar.bz2" "${localEncryptedPath}"
  sync
  local replaceLocal=false
  if [ ${#} -ge 2 ] && [ "${2}" = "--replace-local-backup" ]; then
@@ -897,6 +1343,20 @@ format-backup-ts() {
  date -u -d "${ts:0:4}-${ts:4:2}-${ts:6:2} ${ts:8:2}:${ts:10:2}:${ts:12:2}" +"%Y-%m-%d %H:%M:%S UTC" 2>/dev/null
 }
 
+# normalizes the creation time column of 'gcloud storage ls --long' lines to UTC (YYYY-MM-DDTHH:MM:SSZ)
+utc-ls-lines() {
+ local lines
+ lines=$(grep -E '^ *[0-9]+ +[^ ]+ +gs://')
+ [ -n "${lines}" ] || return 0
+ paste -d' ' <(awk '{ print $1 }' <<< "${lines}") \
+             <(awk '{ print $2 }' <<< "${lines}" | date -u -f - +"%Y-%m-%dT%H:%M:%SZ") \
+             <(awk '{ print $3 }' <<< "${lines}")
+}
+
+format-iso-time() {
+ date -u -d "${1}" +"%Y-%m-%d %H:%M:%S UTC" 2>/dev/null || echo "${1}"
+}
+
 slave-status-field() {
  local text="${1}"
  local field="${2}"
@@ -922,10 +1382,15 @@ purge-old-binlogs() {
   log-line wrn "replication not healthy (IO=${ioRunning}, SQL=${sqlRunning}) - skipping binlog purge"
   return 1
  fi
+ if [ "$(docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -N -B -e "SELECT @@log_bin" 2>/dev/null)" != "1" ]; then
+  log-line msg "${DBContainerName} doesn't write a binlog - nothing to purge"
+  return 0
+ fi
  local purgeBefore
  purgeBefore=$(date -u -d "-${BINLOG_PURGE_MAX_AGE_DAYS} days" +"%Y-%m-%d %H:%M:%S")
  log-line msg "replication healthy - purging binlogs older than ${purgeBefore} UTC"
- if docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "PURGE BINARY LOGS BEFORE '${purgeBefore}';" 2>/dev/null; then
+ # the server reads the cutoff in its session time zone, so that's set to UTC too
+ if docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SET time_zone = '+00:00'; PURGE BINARY LOGS BEFORE '${purgeBefore}';" 2>/dev/null; then
   log-line msg "old binlogs purged"
  else
   log-line err "failed to purge old binlogs"
@@ -994,17 +1459,24 @@ status-schedule() {
   fi
  done
  [ "${missingCron}" = true ] && echo "    -> run '${scriptName} install-cron' to (re)install the schedule from .env"
+ if [ "$(date +%z)" != "+0000" ]; then
+  echo "  ${YELLOW}note${RESET}: cron runs these in the system timezone ($(date +"%Z, UTC%:z")), not in UTC"
+ fi
  echo
 }
 
 # size of a backup stream file, flagging a missing or empty one
+# size of the backup stream in a full/ or inc_*/ dir, flagging a missing or empty one
 stream-size() {
- if [ ! -f "${1}" ]; then
-  echo "${RED}missing${RESET} (${1})"
- elif [ ! -s "${1}" ]; then
+ local streamFile
+ if ! streamFile=$(stream-file "${1}"); then
+  echo "${RED}missing${RESET} (no backup stream in ${1})"
+ elif [ ! -s "${streamFile}" ]; then
   echo "${RED}EMPTY${RESET} - this backup is broken"
+ elif [[ "${streamFile}" == *.zst ]]; then
+  echo "$(size-of "${streamFile}") (compressed)"
  else
-  size-of "${1}"
+  echo "$(size-of "${streamFile}") (uncompressed)"
  fi
 }
 
@@ -1013,12 +1485,12 @@ status-local-backups() {
  load-state
  local chainDir="${LocalBackupDir}/${lastFullTs}"
  if [ -n "${lastFullTs}" ]; then
-  echo "  last full backup:        ${lastFullTs} ($(format-backup-ts "${lastFullTs}")), $(stream-size "${chainDir}/mariadb/full/backup.xbstream")"
+  echo "  last full backup:        ${lastFullTs} ($(format-backup-ts "${lastFullTs}")), $(stream-size "${chainDir}/mariadb/full")"
  else
   echo "  last full backup:        none"
  fi
  if [ -n "${lastIncTs}" ]; then
-  echo "  last incremental backup: ${lastIncTs} ($(format-backup-ts "${lastIncTs}")), $(stream-size "${chainDir}/mariadb/inc_${lastIncTs}/backup.xbstream")"
+  echo "  last incremental backup: ${lastIncTs} ($(format-backup-ts "${lastIncTs}")), $(stream-size "${chainDir}/mariadb/inc_${lastIncTs}")"
  else
   echo "  last incremental backup: none"
  fi
@@ -1052,7 +1524,8 @@ status-cloud-backups() {
  # output goes to a file rather than $(...), so stray gcloud subprocesses holding the pipe open can't outlive the timeout
  local lsOutput lsExit lsOutputFile
  lsOutputFile=$(mktemp)
- timeout -k 1 "${STATUS_CLOUD_TIMEOUT_SECONDS}" gcloud storage ls --long "gs://${GCSBucket}/*-backup.${BackupInstanceName}.*.tar.bz2.aes256" >"${lsOutputFile}" 2>&1
+ timeout -k 1 "${STATUS_CLOUD_TIMEOUT_SECONDS}" gcloud storage ls --long "gs://${GCSBucket}/${BackupInstanceName}/**" \
+                                                "gs://${GCSBucket}/*-backup.${BackupInstanceName}.*.tar.bz2.aes256" >"${lsOutputFile}" 2>&1
  lsExit=${?}
  lsOutput=$(cat "${lsOutputFile}")
  rm -f "${lsOutputFile}"
@@ -1073,36 +1546,106 @@ status-cloud-backups() {
   echo
   return
  fi
- local candidates
- candidates=$(grep -E ".*-backup\.${BackupInstanceName}\.[0-9]{14}\.tar\.bz2\.aes256$" <<< "${lsOutput}")
- if [ -z "${candidates}" ]; then
+ # each --long line is "<size> <creation time> <url>"; creation times are converted to UTC, whatever timezone gcloud uses
+ lsOutput=$(utc-ls-lines <<< "${lsOutput}")
+ local chainsURL="gs://${GCSBucket}/${BackupInstanceName}"
+ local chainLines legacyLines
+ chainLines=$(grep -E " ${chainsURL}/[0-9]{14}/.*${CLOUD_PIECE_SUFFIX//./\\.}$" <<< "${lsOutput}")
+ legacyLines=$(grep -E -- "-backup\.${BackupInstanceName}\.[0-9]{14}\.tar\.bz2\.aes256$" <<< "${lsOutput}")
+ if [ -z "${chainLines}" ] && [ -z "${legacyLines}" ]; then
   echo "  no backups found in gs://${GCSBucket}/"
   echo
   return
  fi
- # each --long line is "<size> <creation time> <url>"; the object name's timestamp is the chain's full backup,
- # not the upload time (daily uploads re-archive the whole chain under its full backup's timestamp)
- local latestFile="" latestCreated="" latestSize="" latestTs=""
- local size created url
- while read -r size created url; do
-  if [[ "${created}" > "${latestCreated}" ]]; then
-   latestCreated="${created}"
-   latestFile="${url}"
-   latestSize="${size}"
-  fi
- done <<< "${candidates}"
- latestTs=$(basename "${latestFile}" | grep -oE '[0-9]{14}')
- local level
- level=$(basename "${latestFile}" | cut -d'-' -f1)
- echo "  last upload: ${level} backup, uploaded $(date -u -d "${latestCreated}" +"%Y-%m-%d %H:%M:%S UTC" 2>/dev/null || echo "${latestCreated}")"
- if [ "${latestSize}" -lt 1024 ] 2>/dev/null; then
-  echo "  size:        ${RED}$(human-size "${latestSize}")${RESET} - suspiciously small, probably a broken upload"
+ if [ -n "${chainLines}" ]; then
+  local chainTs
+  chainTs=$(awk '{ print $3 }' <<< "${chainLines}" | sed -nE "s#^${chainsURL}/([0-9]{14})/.*#\1#p" | sort | tail -1)
+  local pieceCount totalSize lastCreated lastObject
+  read -r pieceCount totalSize lastCreated lastObject < <(awk -v prefix="${chainsURL}/${chainTs}/" '
+   index($3, prefix) == 1 { n++; total += $1; if ($2 > last) { last = $2; object = $3 } }
+   END { printf "%d %.0f %s %s\n", n, total, last, substr(object, length(prefix) + 1) }' <<< "${chainLines}")
+  echo "  latest chain:  ${chainTs} ($(format-backup-ts "${chainTs}")) - ${pieceCount} piece(s), $(human-size "${totalSize}")"
+  echo "  last upload:   ${lastObject%"${CLOUD_PIECE_SUFFIX}"}, $(format-iso-time "${lastCreated}")"
  else
-  echo "  size:        $(human-size "${latestSize}")"
+  echo "  latest chain:  none uploaded piece by piece yet"
  fi
- echo "  chain:       full backup ${latestTs} ($(format-backup-ts "${latestTs}"))"
- echo "  object:      ${latestFile}"
+ load-state
+ if [ -n "${lastFullTs}" ] && [ -d "${LocalBackupDir}/${lastFullTs}" ]; then
+  local chainDir="${LocalBackupDir}/${lastFullTs}"
+  local cloudObjects
+  cloudObjects=$(awk '{ print $3 }' <<< "${chainLines}")
+  local piece pending=0
+  for piece in $(list-chain-pieces "${chainDir}"); do
+   piece-needs-upload "${chainDir}" "${piece}" "$(cloud-chain-url "${lastFullTs}")/${piece}${CLOUD_PIECE_SUFFIX}" "${cloudObjects}" \
+    && pending=$((pending + 1))
+  done
+  if [ ${pending} -eq 0 ]; then
+   echo "  not uploaded:  none (local chain ${lastFullTs} is fully uploaded)"
+  else
+   echo "  not uploaded:  ${YELLOW}${pending} piece(s)${RESET} of local chain ${lastFullTs} - uploaded after each daily backup, or run '${scriptName} bkp-to-cloud ${lastFullTs}'"
+  fi
+ fi
+ if [ -n "${legacyLines}" ]; then
+  local legacyCount legacySize legacyCreated legacyObject
+  legacyCount=$(wc -l <<< "${legacyLines}")
+  read -r legacySize legacyCreated legacyObject < <(sort -k3 <<< "${legacyLines}" | tail -1)
+  local legacyTs
+  legacyTs=$(basename "${legacyObject}" | grep -oE '[0-9]{14}')
+  local legacySizeText
+  legacySizeText=$(human-size "${legacySize}")
+  [ "${legacySize}" -lt 1024 ] && legacySizeText="${RED}${legacySizeText}${RESET} - suspiciously small, probably a broken upload"
+  echo "  older format:  ${legacyCount} single-archive backup(s), latest chain ${legacyTs} ($(format-backup-ts "${legacyTs}")), uploaded $(format-iso-time "${legacyCreated}"), ${legacySizeText}"
+ fi
  echo
+}
+
+status-binlogs() {
+ echo "${BOLD}${CYAN}Binlogs (point-in-time restore)${RESET}"
+ local binlogPattern
+ if [ "${DBBinlogSource}" = "master" ]; then
+  echo "  source:      the master's binlogs, fetched hourly from ${DBMasterHost:-(DBMasterHost not set)}:${DBMasterPort}"
+  binlogPattern='^.+\.[0-9]+$'
+ elif [ "${DBBinlogSource}" = "local" ]; then
+  echo "  source:      ${DBContainerName}'s own binlogs (${DBBinlogBasename:-DBBinlogBasename not set}), copied hourly"
+  binlogPattern="^${DBBinlogBasename}\.[0-9]+$"
+  local problem=""
+  if [ "${dbUp}" = true ]; then
+   problem=$(local-binlog-problem)
+  fi
+  [ -n "${problem}" ] && echo "  ${RED}unusable${RESET}:    ${problem}"
+ else
+  echo "  source:      ${RED}unknown DBBinlogSource '${DBBinlogSource}'${RESET} - use 'local' or 'master'"
+  echo
+  return
+ fi
+ load-state
+ local binlogDir="${LocalBackupDir}/${lastFullTs}/mariadb/binlogs"
+ local latest=""
+ [ -n "${lastFullTs}" ] && latest=$(ls "${binlogDir}" 2>/dev/null | grep -E "${binlogPattern}" | grep -v relay | sort | tail -1)
+ if [ -n "${latest}" ]; then
+  echo "  last saved:  ${latest} ($(size-of "${binlogDir}/${latest}")), modified $(date -u -d "@$(stat -c %Y "${binlogDir}/${latest}")" +"%Y-%m-%d %H:%M:%S UTC")"
+ else
+  echo "  last saved:  ${YELLOW}none${RESET} in the current chain - point-in-time restore only reaches the last daily backup"
+ fi
+ echo
+}
+
+# the binlog positions the last restore recorded, for starting replication after it
+status-restored-binlog-pos() {
+ local restored replayed
+ restored=$(read-datadir-file "${RESTORED_BINLOG_POS_NAME}")
+ replayed=$(read-datadir-file "${BINLOGS_REPLAYED_NAME}")
+ if [ -n "${restored}" ]; then
+  local file pos
+  file=$(datadir-file-value "${restored}" file)
+  pos=$(datadir-file-value "${restored}" pos)
+  echo "  restored $(datadir-file-value "${restored}" restored_at) UTC, binlog position after the restore: ${file}:${pos}"
+  echo "    -> on replicas restored the same way, run '${scriptName} start-replica ${file} ${pos}'"
+ fi
+ if [ -n "${replayed}" ] && [ -n "${DBMasterHost}" ] && [ "$(datadir-file-value "${replayed}" coordinates)" = "master" ]; then
+  echo "  restored up to $(datadir-file-value "${replayed}" replayed_to) UTC from the master's binlogs, ending at $(datadir-file-value "${replayed}" end_file):$(datadir-file-value "${replayed}" end_pos)"
+  echo "    -> if the master wasn't restored, run '${scriptName} start-replica' to resume replication there"
+ fi
 }
 
 status-replication() {
@@ -1121,6 +1664,7 @@ status-replication() {
  slaveStatus=$(docker exec "${DBContainerName}" mariadb -u"${DBUser}" -p"${DBPassword}" -e "SHOW SLAVE STATUS\G" 2>/dev/null)
  if [ -z "${slaveStatus}" ]; then
   echo "  not a replica"
+  status-restored-binlog-pos
   echo
   return
  fi
@@ -1257,11 +1801,38 @@ sql-escape() {
  echo "${str//\'/\\\'}"
 }
 
-# prints "<binlog file> <position>" recorded by mariadb-backup in the restored datadir
+# prints the master's "<binlog file> <position>" the restored datadir continues from: where the restore's binlog replay
+# ended, if it replayed the master's binlogs, otherwise what mariadb-backup recorded: the master's position if the
+# backup was made on a replica (with DBBinlogSource=master), otherwise the backed up server's own binlog position
 read-restored-binlog-pos() {
- local infoName info
+ local replayed
+ replayed=$(read-datadir-file "${BINLOGS_REPLAYED_NAME}")
+ if [ -n "${replayed}" ]; then
+  local replayedTo
+  replayedTo=$(datadir-file-value "${replayed}" replayed_to)
+  if [ "$(datadir-file-value "${replayed}" coordinates)" != "master" ]; then
+   log-line err "the restore replayed this server's own binlogs (up to ${replayedTo} UTC), so the master position its backup recorded is out of date" >&2
+   log-line err "pass the master's binlog position to resume from explicitly: ${scriptName} start-replica <master-log-file> <master-log-pos>" >&2
+   return 1
+  fi
+  log-line msg "resuming where the restore's replay of the master's binlogs ended (up to ${replayedTo} UTC)" >&2
+  log-line msg "if the master was restored as well, pass the position its restore logged instead: ${scriptName} start-replica <file> <pos>" >&2
+  echo "$(datadir-file-value "${replayed}" end_file) $(datadir-file-value "${replayed}" end_pos)"
+  return 0
+ fi
+ local infoName info logFile logPos
+ for infoName in mariadb_backup_slave_info xtrabackup_slave_info; do
+  info=$(read-datadir-file "${infoName}") || continue
+  logFile=$(sed -nE "s/.*MASTER_LOG_FILE *= *'([^']+)'.*/\1/Ip" <<< "${info}" | head -1)
+  logPos=$(sed -nE "s/.*MASTER_LOG_POS *= *([0-9]+).*/\1/Ip" <<< "${info}" | head -1)
+  if [ -n "${logFile}" ] && [ -n "${logPos}" ]; then
+   log-line msg "found the master's binlog coordinates in ${DBDataDir}/${infoName} (restored from a replica's backup)" >&2
+   echo "${logFile} ${logPos}"
+   return 0
+  fi
+ done
  for infoName in xtrabackup_info mariadb_backup_info; do
-  info=$(docker run --rm -v "${DBDataDir}":/datadir:ro "${ALPINE_IMAGE}" cat "/datadir/${infoName}" 2>/dev/null) && break
+  info=$(read-datadir-file "${infoName}") && break
   info=""
  done
  if [ -z "${info}" ]; then
@@ -1269,7 +1840,6 @@ read-restored-binlog-pos() {
   log-line err "pass the coordinates explicitly: ${scriptName} start-replica <master-log-file> <master-log-pos>" >&2
   return 1
  fi
- local logFile logPos
  logFile=$(sed -nE "s/^binlog_pos *= *filename '([^']+)'.*/\1/p" <<< "${info}" | head -1)
  logPos=$(sed -nE "s/^binlog_pos *= *.*position '?([0-9]+)'?.*/\1/p" <<< "${info}" | head -1)
  if [ -z "${logFile}" ] || [ -z "${logPos}" ]; then
@@ -1345,6 +1915,7 @@ status() {
   status-schedule
   status-local-backups
   status-replication
+  status-binlogs
   status-disk-space
   # last, since it depends on the network and may take up to STATUS_CLOUD_TIMEOUT_SECONDS
   status-cloud-backups

@@ -8,7 +8,7 @@ fi
 log-line() {
  local level="${1}"
  local line="${2}"
- echo "[$(date +"%Y-%m-%d %H:%M:%S")] (${level}): ${line}"
+ echo "[$(date -u +"%Y-%m-%d %H:%M:%S")] (${level}): ${line}"
 }
 
 require-vars() {
@@ -40,14 +40,15 @@ require-cloud-provider() {
 }
 
 # external tools bkp depends on, in the order missing ones are reported
-KNOWN_TOOLS=(docker gcloud tar bzip2 openssl flock pgrep crontab envsubst)
+KNOWN_TOOLS=(docker gcloud tar zstd openssl flock pgrep crontab envsubst bzip2)
 
 tool-install-hint() {
  case "${1}" in
   docker)   echo "install Docker Engine: https://docs.docker.com/engine/install/";;
   gcloud)   echo "install the Google Cloud CLI: https://cloud.google.com/sdk/docs/install, then run 'gcloud init'";;
   tar)      echo "install the tar package (e.g. 'sudo apt install tar')";;
-  bzip2)    echo "install the bzip2 package (e.g. 'sudo apt install bzip2')";;
+  zstd)     echo "install the zstd package (e.g. 'sudo apt install zstd')";;
+  bzip2)    echo "install the bzip2 package (e.g. 'sudo apt install bzip2') - only needed to restore cloud backups uploaded by older bkp versions";;
   openssl)  echo "install the openssl package (e.g. 'sudo apt install openssl')";;
   flock)    echo "install the util-linux package (e.g. 'sudo apt install util-linux')";;
   pgrep)    echo "install the procps package (e.g. 'sudo apt install procps')";;

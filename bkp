@@ -35,13 +35,15 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
 
   ${BOLD}start-replica${RESET} [<master-log-file> <master-log-pos>]
    - configures ${BOLD}\${DBContainerName}${RESET} as a replica of ${BOLD}\${DBMasterHost}${RESET} (${BOLD}CHANGE MASTER TO${RESET}) using the ${BOLD}DBMaster*${RESET} settings, then runs ${BOLD}START SLAVE${RESET}
-   - without params, reads the binlog file/position from ${BOLD}xtrabackup_info${RESET} in ${BOLD}\${DBDataDir}${RESET} (left there by ${BOLD}restore-db-local${RESET})
+   - without params, resumes from the master's position the last ${BOLD}restore-db-local${RESET} left in ${BOLD}\${DBDataDir}${RESET}: where its replay of the master's binlogs ended, or if it replayed none, the position in the backup (the master's if the backup was made on a replica, otherwise the backed up server's own)
+   - that's only right if the master wasn't restored; if it was, pass the binlog position the master's restore logged (also shown by ${BOLD}status${RESET} on the master)
    - does nothing if the database isn't up, or is already configured as a replica (use ${BOLD}restart-replication${RESET} for that)
 
   ${BOLD}bkp-db-weekly${RESET}
    - performs a weekly (full) backup of the database
    - any existing lower-priority backup processes (daily or hourly) will be terminated
-   - the backup archive is stored locally in ${BOLD}\${LocalBackupDir}/<timestamp>/mariadb/full${RESET}
+   - the backup stream is compressed with zstd and stored locally in ${BOLD}\${LocalBackupDir}/<timestamp>/mariadb/full${RESET}
+   - then uploads to cloud whatever the previous week's chain hasn't uploaded yet, removes that chain locally once it's fully in cloud, and uploads the new full backup
 
   ${BOLD}bkp-db-daily${RESET} [timestamp]
    - performs a daily (incremental) backup of the database, appending to the latest full backup, or one specified by ${BOLD}[timestamp]${RESET}
@@ -49,10 +51,13 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
    - if an hourly backup is running it will be terminated before the daily backup starts
    - if there are no previous full backups, or the latest one is older than 8 days, this runs ${BOLD}bkp-db-weekly${RESET} instead and then exits (only when no [timestamp] is given)
    - also runs ${BOLD}bkp-folders${RESET} for the same timestamp
-   - the backup stream is stored locally in ${BOLD}\${LocalBackupDir}/<timestamp>/mariadb/inc_yyyyMMddHHmmss${RESET}
+   - the backup stream is compressed with zstd and stored locally in ${BOLD}\${LocalBackupDir}/<timestamp>/mariadb/inc_yyyyMMddHHmmss${RESET}
+   - then uploads to cloud the pieces of the chain that aren't there yet (only when no [timestamp] is given)
 
   ${BOLD}bkp-db-hourly${RESET} [timestamp]
    - performs an hourly (binlog) backup, starting from the binlog active during the last full backup, or the one specified by ${BOLD}[timestamp]${RESET}
+   - with ${BOLD}DBBinlogSource=local${RESET}, copies the database's own binlogs (fails if the server's binlog can't be used for point-in-time restore, e.g. a replica without log_bin/log_slave_updates)
+   - with ${BOLD}DBBinlogSource=master${RESET}, fetches the master's binlogs over the network (for replicas without their own binlog)
    - if any higher priority backup process (weekly or daily) is running, this will do nothing
    - if there are no previous full backups, or the latest one is older than 8 days, this runs ${BOLD}bkp-db-weekly${RESET} instead (only when no [timestamp] is given)
    - the binlogs are stored locally in ${BOLD}\${LocalBackupDir}/<timestamp>/mariadb/binlogs${RESET}
@@ -61,21 +66,27 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
   ${BOLD}bkp-folders${RESET} <timestamp>
    - backs up the folders configured in ${BOLD}BackupFolders${RESET} to ${BOLD}\${LocalBackupDir}/<timestamp>/files${RESET}
 
-  ${BOLD}bkp-to-cloud${RESET} <timestamp> <weekly|daily>
-   - archives everything in ${BOLD}\${LocalBackupDir}/<timestamp>${RESET} to a bzip2 archive, encrypts it with ${BOLD}aes-256-cbc${RESET} using ${BOLD}AESPassphrase${RESET}, and uploads it to ${BOLD}gs://\${GCSBucket}/${RESET}
-   - the encrypted archive is built in ${BOLD}\${WorkDir}${RESET} (or ${BOLD}/tmp${RESET} if ${BOLD}WorkDir${RESET} isn't set)
-   - an existing cloud object with the same name is only replaced once the new upload succeeds
-   - if upload to cloud fails, moves the encrypted archive to ${BOLD}\${RestoreDir}${RESET}
+  ${BOLD}bkp-to-cloud${RESET} <timestamp>
+   - uploads the backup chain in ${BOLD}\${LocalBackupDir}/<timestamp>${RESET} to ${BOLD}gs://\${GCSBucket}/\${BackupInstanceName}/<timestamp>/${RESET}, one object per piece (full backup, each incremental, each binlog, the backed up folders)
+   - only uploads pieces that are new or changed since their last upload (tracked in ${BOLD}.cloud-manifest${RESET} in the chain dir), or missing from cloud
+   - each piece is tarred, zstd-compressed, encrypted with ${BOLD}aes-256-cbc${RESET} using ${BOLD}AESPassphrase${RESET} and streamed straight to cloud, using no local disk space
+   - an existing cloud object is only replaced once the new upload of that piece succeeds; failed pieces are retried on the next upload
+   - waits for any other cloud upload that's still running to finish first
 
   ${BOLD}restore-db-local${RESET} <timestamp> [target-datetime]
    - restores the database from a local backup with the given ${BOLD}timestamp${RESET} in ${BOLD}\${LocalBackupDir}${RESET}
-   - if ${BOLD}[target-datetime]${RESET} (format: yyyy-MM-dd HH:mm:ss) is given, performs a point-in-time restore using the archived binlogs
+   - replays the saved binlogs up to ${BOLD}[target-datetime]${RESET} (format: yyyy-MM-dd HH:mm:ss, UTC) for a point-in-time restore, or without it, all of them; stops between transactions, never in the middle of one
+   - logs the database's binlog position after the restore: replicas restored with the same command start replicating from there (${BOLD}start-replica <file> <pos>${RESET})
+   - works with backups made on a master, or on a replica (with ${BOLD}DBBinlogSource=master${RESET}), so a master can be restored from a replica's backup
+   - afterwards, the next backup is a full one, starting a new backup chain
 
   ${BOLD}restore-folders-local${RESET} <timestamp>
    - restores the folders configured in ${BOLD}BackupFolders${RESET} from ${BOLD}\${LocalBackupDir}/<timestamp>/files${RESET}
 
-  ${BOLD}restore-from-cloud${RESET} [target-datetime]
-   - restores the most recent encrypted archive at or before ${BOLD}[target-datetime]${RESET} (format: yyyy-MM-dd HH:mm:ss, default: now) from ${BOLD}gs://\${GCSBucket}/${RESET}, decrypts it, extracts it, and moves the files into ${BOLD}\${LocalBackupDir}${RESET}
+  ${BOLD}restore-from-cloud${RESET} [target-datetime] [--replace-local-backup] [--from-instance=<name>]
+   - downloads the most recent backup chain at or before ${BOLD}[target-datetime]${RESET} (format: yyyy-MM-dd HH:mm:ss, UTC, default: now) from ${BOLD}gs://\${GCSBucket}/${RESET}, decrypts and extracts it into ${BOLD}\${RestoreDir}${RESET} (which must be empty), and moves it into ${BOLD}\${LocalBackupDir}${RESET}
+   - also restores single-archive backups uploaded by older bkp versions (needs bzip2)
+   - ${BOLD}--from-instance=<name>${RESET} restores another instance's backups instead of ${BOLD}\${BackupInstanceName}${RESET}'s, e.g. a replica's onto its master
 
   ${BOLD}install-cron${RESET}
    - installs (or re-installs) weekly/daily/hourly backups as cron jobs, per the ${BOLD}Cron*${RESET} schedule in ${BOLD}.env${RESET}
@@ -85,8 +96,9 @@ usage: ${BOLD}${0} <command> [params...]${RESET}
   ${BOLD}status${RESET}
    - shows which required tools (docker, gcloud, bzip2, ...) are missing, if any, and prints whatever it can check without them
    - shows whether the configured database is reachable, whether the backup cron schedule is installed
-   - shows the timestamp and size of the last local backups and the last backup uploaded to cloud (with its upload time)
+   - shows the timestamp and size of the last local backups, the latest backup chain in cloud (its size and last upload time), and how many local pieces aren't uploaded yet
    - if the database is a replica, shows replication status (log files, positions, seconds behind master, last error)
+   - shows where binlogs for point-in-time restore come from, the last one saved, and whether the configuration can work
    - shows free space on the volumes holding ${BOLD}\${DBDataDir}${RESET} and ${BOLD}\${LocalBackupDir}${RESET}
 
   ${BOLD}help${RESET} | ${BOLD}""${RESET} | ${BOLD}-h${RESET} | ${BOLD}--help${RESET}
@@ -134,6 +146,7 @@ fi
 [ -z "${DBContainerName}" ] && DBContainerName="database"
 [ -z "${DBMasterPort}" ] && DBMasterPort=3306
 [ -z "${DBBackupImage}" ] && DBBackupImage="mariadb:11.8"
+[ -z "${DBBinlogSource}" ] && DBBinlogSource="local"
 [ -z "${LocalBackupDir}" ] && LocalBackupDir="${scriptDir}/backups"
 [ -z "${RestoreDir}" ] && RestoreDir="${scriptDir}/restored-backup"
 [ -z "${CloudProvider}" ] && CloudProvider="gcloud"
@@ -145,7 +158,7 @@ fi
 
 # set defaults, overwrite by values already set in .env by user, then recreate .env with values already loaded + any non-overwritten defaults
 set -a
-export DBType DBPort DBContainerName DBMasterPort DBBackupImage LocalBackupDir RestoreDir CloudProvider BackupInstanceName CronWeekly CronDaily CronHourly LogFile
+export DBType DBPort DBContainerName DBMasterPort DBBackupImage DBBinlogSource LocalBackupDir RestoreDir CloudProvider BackupInstanceName CronWeekly CronDaily CronHourly LogFile
 [ -f "${envFile}" ] && . "${envFile}"
 set +a
 # without envsubst the redirect alone would truncate .env, losing its values
