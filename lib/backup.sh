@@ -25,6 +25,10 @@ BINLOG_PURGE_MAX_AGE_DAYS=14
 STATUS_MAX_LINES=48
 STATUS_MAX_COLUMNS=128
 STATUS_CLOUD_TIMEOUT_SECONDS=5
+# error text (extended regexes) that marks a gcloud failure as a connection problem rather than bad credentials
+GCLOUD_NETWORK_ERRORS=("Max retries exceeded" "Failed to establish a new connection" "NameResolutionError"
+                       "Temporary failure in name resolution" "Name or service not known" "Network is unreachable"
+                       "No route to host" "Connection (refused|reset|aborted)" "timed out" "ProxyError")
 ZSTD_LEVEL=3
 CLOUD_MANIFEST_NAME=".cloud-manifest"
 CLOUD_PIECE_SUFFIX=".tar.zst.aes256"
@@ -1764,7 +1768,12 @@ status-cloud-backups() {
  if [ ${lsExit} -ne 0 ] && ! grep -qi "matched no objects" <<< "${lsOutput}"; then
   local lsError
   lsError=$(grep -m1 "ERROR" <<< "${lsOutput}")
-  if grep -qiE "do not currently have an active account|gcloud auth login|reauthenticat|invalid_grant" <<< "${lsOutput}"; then
+  # gcloud says "run gcloud auth login" whenever refreshing its short-lived access token fails, network errors included,
+  # so connection failures are told apart first: the stored credentials are still valid then, and logging in again is
+  # needless (and painful on a headless server)
+  if grep -qiE "$(IFS='|'; echo "${GCLOUD_NETWORK_ERRORS[*]}")" <<< "${lsOutput}"; then
+   echo "  ${RED}unable to reach Google Cloud${RESET} - check your internet/network connection (gcloud credentials are fine, no need to log in again)"
+  elif grep -qiE "do not currently have an active account|reauthenticat|invalid_grant|invalid_rapt|expired or revoked" <<< "${lsOutput}"; then
    echo "  ${RED}gcloud is not authenticated${RESET} (account ${activeAccount}) - run 'gcloud auth login' to refresh credentials"
   else
    echo "  ${RED}unable to list gs://${GCSBucket}/${RESET} - check your internet/network connection and bucket access"
